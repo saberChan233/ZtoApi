@@ -58,9 +58,30 @@ declare namespace Deno {
   function serveHttp(conn: Conn): HttpConn;
   function serve(handler: (request: Request) => Promise<Response>): void;
 
+  class Command {
+    constructor(command: string | URL, options?: Record<string, unknown>);
+    spawn(): ChildProcess;
+  }
+
+  interface ChildProcess {
+    readonly pid: number;
+    readonly stdin: WritableStream<Uint8Array>;
+    readonly stdout: ReadableStream<Uint8Array>;
+    readonly stderr: ReadableStream<Uint8Array>;
+    readonly status: Promise<{ success: boolean; code: number; signal?: string }>;
+    kill(signo?: string): void;
+  }
+
   namespace env {
     function get(key: string): string | undefined;
   }
+
+  function kill(pid: number, signo?: string): void;
+
+  function makeTempFile(options?: { suffix?: string }): Promise<string>;
+  function readTextFile(path: string | URL): Promise<string>;
+  function remove(path: string | URL): Promise<void>;
+  function stat(path: string | URL): Promise<{ isFile: boolean }>;
 }
 
 /**
@@ -160,11 +181,16 @@ interface UpstreamRequest {
   stream: boolean;
   model: string;
   messages: Message[];
+  captcha_verify_param?: string;
+  extra?: Record<string, unknown>;
   params: Record<string, unknown>;
   features: Record<string, unknown>;
   background_tasks?: Record<string, boolean>;
   chat_id?: string;
+  session_id?: string;
   id?: string;
+  current_user_message_id?: string;
+  current_user_message_parent_id?: string | null;
   mcp_servers?: string[];
   model_item?: {
     id: string;
@@ -180,6 +206,36 @@ interface UpstreamRequest {
   variables?: Record<string, string>;
   files?: UploadedFile[];
   signature_prompt?: string;
+}
+
+interface UpstreamChatHistoryNode {
+  id: string;
+  parentId: string | null;
+  childrenIds: string[];
+  role: string;
+  content: Message["content"];
+  timestamp?: number;
+  models?: string[];
+}
+
+interface UpstreamChatBootstrapPayload {
+  id: string;
+  title: string;
+  models: string[];
+  params: Record<string, unknown>;
+  history: {
+    messages: Record<string, UpstreamChatHistoryNode>;
+    currentId: string | null;
+  };
+  tags: unknown[];
+  flags: unknown[];
+  features: unknown[];
+  enable_thinking: boolean;
+  auto_web_search: boolean;
+  message_version: number;
+  extra: Record<string, unknown>;
+  timestamp: number;
+  type: string;
 }
 
 /**
@@ -223,6 +279,12 @@ interface UpstreamData {
     done: boolean;
     usage?: Usage;
     error?: UpstreamError;
+    data?: {
+      error?: UpstreamError;
+      done?: boolean;
+      delta_content?: string;
+      phase?: string;
+    };
     inner?: {
       error?: UpstreamError;
     };
@@ -233,6 +295,9 @@ interface UpstreamData {
 interface UpstreamError {
   detail: string;
   code: number;
+  error_code?: string;
+  captcha_error_type?: string;
+  verify_code?: string;
 }
 
 interface ModelsResponse {
@@ -418,45 +483,23 @@ class SmartHeaderGenerator {
     }
 
     // 生成新的头部
-    const headers = await this.generateFreshHeaders();
-    this.cachedHeaders = headers;
+    const baseHeaders = await this.generateFreshHeaders();
+    this.cachedHeaders = baseHeaders;
     this.cacheExpiry = now + this.CACHE_DURATION;
 
     debugLog("智能 Header 已生成并缓存");
+    const headers = { ...baseHeaders };
+    if (chatId) {
+      headers["Referer"] = `${ORIGIN_BASE}/c/${chatId}`;
+    }
     return headers;
   }
 
   private static async generateFreshHeaders(): Promise<Record<string, string>> {
-    // 随机选择浏览器配置
-    const browserConfigs = [
-      {
-        ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
-        secChUa: '"Chromium";v="140", "Not=A?Brand";v="24", "Google Chrome";v="140"',
-        version: "140.0.0.0"
-      },
-      {
-        ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
-        secChUa: '"Chromium";v="139", "Not=A?Brand";v="24", "Google Chrome";v="139"',
-        version: "139.0.0.0"
-      },
-      {
-        ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
-        secChUa: '"Not_A Brand";v="8", "Chromium";v="126", "Firefox";v="126"',
-        version: "126.0"
-      },
-      {
-        ua: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
-        secChUa: '"Chromium";v="140", "Not=A?Brand";v="24", "Google Chrome";v="140"',
-        version: "140.0.0.0"
-      }
-    ];
-
-    const config = browserConfigs[Math.floor(Math.random() * browserConfigs.length)];
-
-    return {
-      // 基础头部
-      "Accept": "*/*",
-      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      return {
+        // 基础头部
+        "Accept": "*/*",
+        "Accept-Language": getPreferredBrowserAcceptLanguage(),
       "Accept-Encoding": "gzip, deflate, br, zstd",
       "Cache-Control": "no-cache",
       "Connection": "keep-alive",
@@ -467,15 +510,16 @@ class SmartHeaderGenerator {
       "Sec-Fetch-Site": "same-origin",
 
       // 浏览器特定头部
-      "User-Agent": config.ua,
-      "Sec-Ch-Ua": config.secChUa,
-      "Sec-Ch-Ua-Mobile": "?0",
-      "Sec-Ch-Ua-Platform": '"Windows"',
+      "User-Agent": getPreferredBrowserUserAgent(),
+      "Sec-Ch-Ua": getPreferredSecChUa(),
+      "Sec-Ch-Ua-Mobile": getPreferredSecChUaMobile(),
+      "Sec-Ch-Ua-Platform": getPreferredSecChUaPlatform(),
 
       // Z.AI 特定头部
       "Origin": ORIGIN_BASE,
-      "Referer": `${ORIGIN_BASE}/`,
+      "Referer": "",
       "X-Fe-Version": X_FE_VERSION,
+      "X-Region": BROWSER_REGION,
     };
   }
 
@@ -526,7 +570,7 @@ class BrowserFingerprintGenerator {
     }
 
     const now = new Date(timestamp);
-    const localTime = now.toISOString().replace('T', ' ').substring(0, 23) + 'Z';
+    const localTime = now.toISOString();
 
     return {
       // 基础参数
@@ -538,21 +582,21 @@ class BrowserFingerprintGenerator {
       "token": token,
 
       // 浏览器环境参数
-      "user_agent": BROWSER_UA,
-      "language": "zh-CN",
-      "languages": "zh-CN,zh",
-      "timezone": "Asia/Shanghai",
+      "user_agent": getPreferredBrowserUserAgent(),
+      "language": getPreferredBrowserLanguage(),
+      "languages": getPreferredBrowserLanguages(),
+      "timezone": getPreferredBrowserTimezone(),
       "cookie_enabled": "true",
 
       // 屏幕参数
-      "screen_width": "2048",
-      "screen_height": "1152",
-      "screen_resolution": "2048x1152",
-      "viewport_height": "654",
-      "viewport_width": "1038",
-      "viewport_size": "1038x654",
-      "color_depth": "24",
-      "pixel_ratio": "1.25",
+      "screen_width": getPreferredBrowserScreenWidth(),
+      "screen_height": getPreferredBrowserScreenHeight(),
+      "screen_resolution": `${getPreferredBrowserScreenWidth()}x${getPreferredBrowserScreenHeight()}`,
+      "viewport_height": getPreferredBrowserViewportHeight(),
+      "viewport_width": getPreferredBrowserViewportWidth(),
+      "viewport_size": `${getPreferredBrowserViewportWidth()}x${getPreferredBrowserViewportHeight()}`,
+      "color_depth": getPreferredBrowserColorDepth(),
+      "pixel_ratio": getPreferredBrowserPixelRatio(),
 
       // URL 参数
       "current_url": chatId ? `${ORIGIN_BASE}/c/${chatId}` : ORIGIN_BASE,
@@ -563,19 +607,19 @@ class BrowserFingerprintGenerator {
       "hostname": "chat.z.ai",
       "protocol": "https:",
       "referrer": "",
-      "title": "Z.ai Chat - Free AI powered by GLM-4.6 & GLM-4.5",
+      "title": getPreferredBrowserTitle(),
 
       // 时间参数
-      "timezone_offset": "-480",
+      "timezone_offset": getPreferredBrowserTimezoneOffset(),
       "local_time": localTime,
       "utc_time": now.toUTCString(),
 
       // 设备参数
       "is_mobile": "false",
       "is_touch": "false",
-      "max_touch_points": "10",
-      "browser_name": "Chrome",
-      "os_name": "Windows",
+      "max_touch_points": "0",
+      "browser_name": getPreferredBrowserName(),
+      "os_name": getPreferredBrowserOsName(),
 
       // 签名参数
       "signature_timestamp": timestamp.toString(),
@@ -584,24 +628,156 @@ class BrowserFingerprintGenerator {
 }
 
 // 伪装前端头部（来自抓包分析）
-const X_FE_VERSION = "prod-fe-1.0.103";
+const X_FE_VERSION = Deno.env.get("UPSTREAM_X_FE_VERSION") || "prod-fe-1.1.35";
 const BROWSER_UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
+  Deno.env.get("UPSTREAM_BROWSER_UA") ||
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0";
 const SEC_CH_UA =
-  '"Chromium";v="140", "Not=A?Brand";v="24", "Google Chrome";v="140"';
-const SEC_CH_UA_MOB = "?0";
-const SEC_CH_UA_PLAT = '"Windows"';
+  Deno.env.get("UPSTREAM_SEC_CH_UA") ||
+  '"Chromium";v="148", "Microsoft Edge";v="148", "Not/A)Brand";v="99"';
+const SEC_CH_UA_MOB = Deno.env.get("UPSTREAM_SEC_CH_UA_MOBILE") || "?0";
+const SEC_CH_UA_PLAT = Deno.env.get("UPSTREAM_SEC_CH_UA_PLATFORM") || '"Linux"';
+const BROWSER_TITLE =
+  Deno.env.get("UPSTREAM_BROWSER_TITLE") ||
+  "Z.ai - Free AI Chatbot & Agent powered by GLM-5.1 & GLM-5";
+const BROWSER_NAME = Deno.env.get("UPSTREAM_BROWSER_NAME") || "Chrome";
+const BROWSER_OS_NAME = Deno.env.get("UPSTREAM_BROWSER_OS_NAME") || "Linux";
+const BROWSER_NAVIGATOR_PLATFORM =
+  Deno.env.get("UPSTREAM_BROWSER_NAVIGATOR_PLATFORM") || "Linux x86_64";
 const ORIGIN_BASE = "https://chat.z.ai";
+const BROWSER_REGION = Deno.env.get("UPSTREAM_BROWSER_REGION") || "overseas";
+const BROWSER_LANGUAGE = Deno.env.get("UPSTREAM_BROWSER_LANGUAGE") || "zh-CN";
+const BROWSER_LANGUAGES = Deno.env.get("UPSTREAM_BROWSER_LANGUAGES") || "zh-CN,en,en-GB,en-US";
+const BROWSER_TIMEZONE = Deno.env.get("UPSTREAM_BROWSER_TIMEZONE") || "Asia/Shanghai";
+const BROWSER_TIMEZONE_OFFSET = Deno.env.get("UPSTREAM_BROWSER_TIMEZONE_OFFSET") || "-480";
+const BROWSER_SCREEN_WIDTH = Deno.env.get("UPSTREAM_BROWSER_SCREEN_WIDTH") || "1552";
+const BROWSER_SCREEN_HEIGHT = Deno.env.get("UPSTREAM_BROWSER_SCREEN_HEIGHT") || "970";
+const BROWSER_VIEWPORT_WIDTH = Deno.env.get("UPSTREAM_BROWSER_VIEWPORT_WIDTH") || "1544";
+const BROWSER_VIEWPORT_HEIGHT = Deno.env.get("UPSTREAM_BROWSER_VIEWPORT_HEIGHT") || "812";
+const BROWSER_COLOR_DEPTH = Deno.env.get("UPSTREAM_BROWSER_COLOR_DEPTH") || "30";
+const BROWSER_PIXEL_RATIO = Deno.env.get("UPSTREAM_BROWSER_PIXEL_RATIO") || "1.649999976158142";
+let IMPORTED_BROWSER_REQUEST_PROFILE: Partial<BrowserRequestProfile> = {};
+let IMPORTED_BROWSER_FINGERPRINT_PROFILE: Record<string, string> = {};
+
+function getPreferredBrowserUserAgent(): string {
+  return IMPORTED_BROWSER_REQUEST_PROFILE.userAgent || IMPORTED_BROWSER_FINGERPRINT_PROFILE.user_agent || BROWSER_UA;
+}
+
+function getPreferredBrowserAcceptLanguage(): string {
+  return IMPORTED_BROWSER_REQUEST_PROFILE.acceptLanguage || IMPORTED_BROWSER_FINGERPRINT_PROFILE.language || BROWSER_LANGUAGE;
+}
+
+function normalizePrimaryLanguage(value: string): string {
+  return value.split(",")[0]?.split(";")[0]?.trim() || value.trim();
+}
+
+function getPreferredBrowserLanguage(): string {
+  return IMPORTED_BROWSER_FINGERPRINT_PROFILE.language ||
+    normalizePrimaryLanguage(IMPORTED_BROWSER_REQUEST_PROFILE.acceptLanguage || BROWSER_LANGUAGE);
+}
+
+function getPreferredSecChUa(): string {
+  return IMPORTED_BROWSER_REQUEST_PROFILE.secChUa || SEC_CH_UA;
+}
+
+function getPreferredSecChUaMobile(): string {
+  return IMPORTED_BROWSER_REQUEST_PROFILE.secChUaMobile || SEC_CH_UA_MOB;
+}
+
+function getPreferredSecChUaPlatform(): string {
+  return IMPORTED_BROWSER_REQUEST_PROFILE.secChUaPlatform || SEC_CH_UA_PLAT;
+}
+
+function getPreferredBrowserLanguages(): string {
+  return IMPORTED_BROWSER_FINGERPRINT_PROFILE.languages || BROWSER_LANGUAGES;
+}
+
+function getPreferredBrowserTimezone(): string {
+  return IMPORTED_BROWSER_FINGERPRINT_PROFILE.timezone || BROWSER_TIMEZONE;
+}
+
+function getPreferredBrowserTimezoneOffset(): string {
+  return IMPORTED_BROWSER_FINGERPRINT_PROFILE.timezone_offset || BROWSER_TIMEZONE_OFFSET;
+}
+
+function getPreferredBrowserScreenWidth(): string {
+  return IMPORTED_BROWSER_FINGERPRINT_PROFILE.screen_width || BROWSER_SCREEN_WIDTH;
+}
+
+function getPreferredBrowserScreenHeight(): string {
+  return IMPORTED_BROWSER_FINGERPRINT_PROFILE.screen_height || BROWSER_SCREEN_HEIGHT;
+}
+
+function getPreferredBrowserViewportWidth(): string {
+  return IMPORTED_BROWSER_FINGERPRINT_PROFILE.viewport_width || BROWSER_VIEWPORT_WIDTH;
+}
+
+function getPreferredBrowserViewportHeight(): string {
+  return IMPORTED_BROWSER_FINGERPRINT_PROFILE.viewport_height || BROWSER_VIEWPORT_HEIGHT;
+}
+
+function getPreferredBrowserColorDepth(): string {
+  return IMPORTED_BROWSER_FINGERPRINT_PROFILE.color_depth || BROWSER_COLOR_DEPTH;
+}
+
+function getPreferredBrowserPixelRatio(): string {
+  return IMPORTED_BROWSER_FINGERPRINT_PROFILE.pixel_ratio || BROWSER_PIXEL_RATIO;
+}
+
+function getPreferredBrowserTitle(): string {
+  return IMPORTED_BROWSER_FINGERPRINT_PROFILE.title || BROWSER_TITLE;
+}
+
+function getPreferredBrowserName(): string {
+  return IMPORTED_BROWSER_FINGERPRINT_PROFILE.browser_name || BROWSER_NAME;
+}
+
+function getPreferredBrowserOsName(): string {
+  return IMPORTED_BROWSER_FINGERPRINT_PROFILE.os_name || BROWSER_OS_NAME;
+}
+const MCP_FEATURES = [
+  { server: "vibe-coding", status: "hidden", type: "mcp" },
+  { server: "ppt-maker", status: "hidden", type: "mcp" },
+  { server: "image-search", status: "hidden", type: "mcp" },
+  { server: "deep-research", status: "hidden", type: "mcp" },
+  { server: "tool_selector", status: "hidden", type: "tool_selector" },
+];
 
 const ANON_TOKEN_ENABLED = true;
 
 /**
  * 环境变量配置
  */
-const UPSTREAM_URL =
-  Deno.env.get("UPSTREAM_URL") || "https://chat.z.ai/api/v2/chat/completions";
+const UPSTREAM_API_BASE =
+  Deno.env.get("UPSTREAM_API_BASE") || "https://chat.z.ai";
+const UPSTREAM_COMPLETION_VERSION =
+  (Deno.env.get("UPSTREAM_COMPLETION_VERSION") || "2").trim().toLowerCase();
 const DEFAULT_KEY = Deno.env.get("DEFAULT_KEY") || "sk-your-key";
 const ZAI_TOKEN = Deno.env.get("ZAI_TOKEN") || "";
+
+function resolveCompletionEndpoint(): string {
+  const normalizedBase = UPSTREAM_API_BASE.replace(/\/+$/, "");
+
+  if (UPSTREAM_COMPLETION_VERSION === "1") {
+    return `${normalizedBase}/api/chat/completions`;
+  }
+
+  if (UPSTREAM_COMPLETION_VERSION === "2") {
+    return `${normalizedBase}/api/v2/chat/completions`;
+  }
+
+  if (/^https?:\/\//.test(UPSTREAM_COMPLETION_VERSION)) {
+    return UPSTREAM_COMPLETION_VERSION;
+  }
+
+  debugLog(
+    "未知 UPSTREAM_COMPLETION_VERSION=%s，回退到 v2 endpoint",
+    UPSTREAM_COMPLETION_VERSION,
+  );
+  return `${normalizedBase}/api/v2/chat/completions`;
+}
+
+const UPSTREAM_URL = resolveCompletionEndpoint();
 
 /**
  * 支持的模型配置
@@ -785,6 +961,15 @@ function normalizeModelId(modelId: string): string {
     "glm-4.6": "glm-4.6",
     "glm4.6": "glm-4.6",
     "glm_4.6": "glm-4.6",
+    "glm-4.7": "glm-4.7",
+    "glm4.7": "glm-4.7",
+    "glm_4.7": "glm-4.7",
+    "glm-5": "glm-5",
+    "glm5": "glm-5",
+    "glm_5": "glm-5",
+    "glm-5.0": "glm-5",
+    "glm5.0": "glm-5",
+    "glm_5.0": "glm-5",
   };
 
   const mapped = modelMappings[normalized];
@@ -962,6 +1147,44 @@ function processMessages(
 const DEBUG_MODE = Deno.env.get("DEBUG_MODE") !== "false"; // 默认为true
 const DEFAULT_STREAM = Deno.env.get("DEFAULT_STREAM") !== "false"; // 默认为true
 const DASHBOARD_ENABLED = Deno.env.get("DASHBOARD_ENABLED") !== "false"; // 默认为true
+const UPSTREAM_TRANSPORT_PREFERENCE =
+  (Deno.env.get("UPSTREAM_TRANSPORT_PREFERENCE") || "auto").toLowerCase();
+const UPSTREAM_HOST_RESOLVE_OVERRIDES =
+  (Deno.env.get("UPSTREAM_HOST_RESOLVE_OVERRIDES") || "").trim();
+const UPSTREAM_IMPERSONATE_BROWSER =
+  (Deno.env.get("UPSTREAM_IMPERSONATE_BROWSER") || "chrome136").trim();
+const UPSTREAM_PROXY_URL = Deno.env.get("UPSTREAM_PROXY_URL") || "";
+const UPSTREAM_SYSTEM_PROXY_AUTO_DETECT =
+  Deno.env.get("UPSTREAM_SYSTEM_PROXY_AUTO_DETECT") !== "false";
+const AUTO_CAPTCHA_PURE_CODE_ENABLED =
+  Deno.env.get("AUTO_CAPTCHA_PURE_CODE_ENABLED") === "true";
+const AUTO_CAPTCHA_PURE_CODE_TIMEOUT_MS = Number(
+  Deno.env.get("AUTO_CAPTCHA_PURE_CODE_TIMEOUT_MS") || "25000"
+);
+const AUTO_CAPTCHA_SESSION_MAX_AGE_MS = Number(
+  Deno.env.get("AUTO_CAPTCHA_SESSION_MAX_AGE_MS") || "120000"
+);
+const AUTO_CAPTCHA_REUSE_ENABLED =
+  Deno.env.get("AUTO_CAPTCHA_REUSE_ENABLED") === "true";
+const AUTO_CAPTCHA_PURE_CODE_CLEAN_STALE_WORKERS =
+  Deno.env.get("AUTO_CAPTCHA_PURE_CODE_CLEAN_STALE_WORKERS") !== "false";
+const AUTO_CAPTCHA_PURE_CODE_WORKER_MAX_OLD_SPACE_MB = Math.max(
+  256,
+  Number(Deno.env.get("AUTO_CAPTCHA_PURE_CODE_WORKER_MAX_OLD_SPACE_MB") || "512"),
+);
+const UPSTREAM_EXTRA_COOKIE_HEADER =
+  (Deno.env.get("UPSTREAM_EXTRA_COOKIE_HEADER") || "").trim();
+const UPSTREAM_LOGGED_IN_COOKIE_HEADER =
+  (Deno.env.get("UPSTREAM_LOGGED_IN_COOKIE_HEADER") || "").trim();
+const UPSTREAM_BROWSER_COOKIE_CAPTURE_PATH =
+  (Deno.env.get("UPSTREAM_BROWSER_COOKIE_CAPTURE_PATH") || "").trim();
+const UPSTREAM_BROWSER_USER_NAME =
+  (Deno.env.get("UPSTREAM_BROWSER_USER_NAME") || "").trim();
+const AUTO_CAPTCHA_MODEL_REGEX = new RegExp(
+  Deno.env.get("AUTO_CAPTCHA_MODEL_REGEX") ||
+    "^(0727-360B-API|0808-360B-DR|glm-4(?:\\.5(?:-air|-flash|-x)?|\\.6|\\.7)?|glm-5(?:\\.0)?)$",
+  "i"
+);
 
 /**
  * Token 池管理系统
@@ -1018,6 +1241,10 @@ class TokenPool {
    * 获取下一个可用 Token
    */
   async getToken(): Promise<string> {
+    if (UPSTREAM_LOGGED_IN_COOKIE_HEADER) {
+      return await this.getLoggedInCookieToken();
+    }
+
     // 如果有配置的 Token，尝试使用
     if (this.tokens.length > 0) {
       const token = this.getNextValidToken();
@@ -1029,6 +1256,11 @@ class TokenPool {
 
     // 降级到匿名 Token
     return await this.getAnonymousToken();
+  }
+
+  private async getLoggedInCookieToken(): Promise<string> {
+    const session = await getLoggedInCookieSession();
+    return session.authToken;
   }
 
   /**
@@ -1117,6 +1349,21 @@ class TokenPool {
     debugLog("匿名 Token 缓存已清除");
   }
 
+  registerImportedToken(token: string): void {
+    const normalized = token.trim();
+    if (!normalized) return;
+    if (this.tokens.some((item) => item.token === normalized)) {
+      return;
+    }
+    this.tokens.unshift({
+      token: normalized,
+      isValid: true,
+      lastUsed: 0,
+      failureCount: 0,
+    });
+    debugLog("已注册浏览器捕获会话 Token: %s", maskToken(normalized));
+  }
+
   /**
    * 获取 Token 池大小
    */
@@ -1128,12 +1375,715 @@ class TokenPool {
    * 检查是否为匿名 Token
    */
   isAnonymousToken(token: string): boolean {
-    return this.anonymousToken === token;
+    return this.anonymousToken === token || anonymousBootstrapState?.authToken === token;
   }
 }
 
 // 全局 Token 池实例
 const tokenPool = new TokenPool();
+
+interface CaptchaSessionState {
+  captchaVerifyParam: string | null;
+  token: string | null;
+  source: string | null;
+  updatedAt: number | null;
+  useCount: number;
+  lastWorkerAttemptAt: number | null;
+  lastWorkerError: string | null;
+  workerLastPayloadSource: string | null;
+}
+
+const captchaSessionState: CaptchaSessionState = {
+  captchaVerifyParam: null,
+  token: null,
+  source: null,
+  updatedAt: null,
+  useCount: 0,
+  lastWorkerAttemptAt: null,
+  lastWorkerError: null,
+  workerLastPayloadSource: null,
+};
+
+let pendingCaptchaFetches = new Map<string, Promise<Record<string, unknown> | null>>();
+let cachedResolvedProxyUrlPromise: Promise<string | null> | null = null;
+
+interface UpstreamChatSessionState {
+  chatId: string;
+  lastUserMessageId: string | null;
+  lastAssistantMessageId: string | null;
+  updatedAt: number;
+}
+
+const upstreamChatSessions = new Map<string, UpstreamChatSessionState>();
+
+function getUpstreamChatSession(token: string): UpstreamChatSessionState | null {
+  const session = upstreamChatSessions.get(token);
+  if (!session) {
+    return null;
+  }
+  if (Date.now() - session.updatedAt > 30 * 60 * 1000) {
+    upstreamChatSessions.delete(token);
+    return null;
+  }
+  return session;
+}
+
+function updateUpstreamChatSession(
+  token: string,
+  update: {
+    chatId: string;
+    lastUserMessageId?: string | null;
+    lastAssistantMessageId?: string | null;
+  },
+): UpstreamChatSessionState {
+  const current = upstreamChatSessions.get(token);
+  const next: UpstreamChatSessionState = {
+    chatId: update.chatId,
+    lastUserMessageId: Object.prototype.hasOwnProperty.call(update, "lastUserMessageId")
+      ? update.lastUserMessageId ?? null
+      : current?.lastUserMessageId ?? null,
+    lastAssistantMessageId: Object.prototype.hasOwnProperty.call(update, "lastAssistantMessageId")
+      ? update.lastAssistantMessageId ?? null
+      : current?.lastAssistantMessageId ?? null,
+    updatedAt: Date.now(),
+  };
+  upstreamChatSessions.set(token, next);
+  return next;
+}
+
+function getCaptchaSessionSnapshot() {
+  return {
+    has_captcha: !!captchaSessionState.captchaVerifyParam,
+    has_token: !!captchaSessionState.token,
+    source: captchaSessionState.source,
+    updated_at: captchaSessionState.updatedAt,
+    age_ms: captchaSessionState.updatedAt
+      ? Date.now() - captchaSessionState.updatedAt
+      : null,
+    use_count: captchaSessionState.useCount,
+    worker_last_attempt_at: captchaSessionState.lastWorkerAttemptAt,
+    worker_last_error: captchaSessionState.lastWorkerError,
+    worker_last_payload_source: captchaSessionState.workerLastPayloadSource,
+    captcha_preview: captchaSessionState.captchaVerifyParam
+      ? captchaSessionState.captchaVerifyParam.slice(0, 48)
+      : null,
+    token_preview: captchaSessionState.token
+      ? captchaSessionState.token.slice(0, 24)
+      : null,
+  };
+}
+
+function isCaptchaSessionFresh(): boolean {
+  if (!captchaSessionState.captchaVerifyParam || !captchaSessionState.updatedAt) {
+    return false;
+  }
+  return Date.now() - captchaSessionState.updatedAt <= AUTO_CAPTCHA_SESSION_MAX_AGE_MS;
+}
+
+function hasReusableCaptchaVerifyParam(authToken: string): boolean {
+  if (!AUTO_CAPTCHA_REUSE_ENABLED) {
+    return false;
+  }
+  if (!isCaptchaSessionFresh()) {
+    return false;
+  }
+  if (!captchaSessionState.captchaVerifyParam) {
+    return false;
+  }
+  if (captchaSessionState.token && captchaSessionState.token !== authToken) {
+    return false;
+  }
+  return captchaSessionState.useCount === 0;
+}
+
+function updateCaptchaSessionState(update: {
+  captchaVerifyParam?: string | null;
+  token?: string | null;
+  source?: string | null;
+  workerLastPayloadSource?: string | null;
+  workerLastError?: string | null;
+}) {
+  if (Object.prototype.hasOwnProperty.call(update, "captchaVerifyParam")) {
+    captchaSessionState.captchaVerifyParam = update.captchaVerifyParam ?? null;
+    captchaSessionState.updatedAt = update.captchaVerifyParam ? Date.now() : null;
+    captchaSessionState.useCount = update.captchaVerifyParam ? 0 : 0;
+  }
+  if (Object.prototype.hasOwnProperty.call(update, "token")) {
+    captchaSessionState.token = update.token ?? null;
+  }
+  if (Object.prototype.hasOwnProperty.call(update, "source")) {
+    captchaSessionState.source = update.source ?? null;
+  }
+  if (Object.prototype.hasOwnProperty.call(update, "workerLastPayloadSource")) {
+    captchaSessionState.workerLastPayloadSource = update.workerLastPayloadSource ?? null;
+  }
+  if (Object.prototype.hasOwnProperty.call(update, "workerLastError")) {
+    captchaSessionState.lastWorkerError = update.workerLastError ?? null;
+  }
+}
+
+function markCaptchaVerifyParamConsumed(reason: string) {
+  if (!captchaSessionState.captchaVerifyParam) {
+    return;
+  }
+  captchaSessionState.useCount += 1;
+  debugLog(
+    "captcha_verify_param 已消费: reason=%s use_count=%d source=%s",
+    reason,
+    captchaSessionState.useCount,
+    captchaSessionState.source || "",
+  );
+}
+
+function invalidateCaptchaVerifyParam(reason: string) {
+  if (!captchaSessionState.captchaVerifyParam && !captchaSessionState.updatedAt) {
+    return;
+  }
+  debugLog(
+    "丢弃缓存 captcha_verify_param: reason=%s source=%s age_ms=%s use_count=%d",
+    reason,
+    captchaSessionState.source || "",
+    captchaSessionState.updatedAt ? String(Date.now() - captchaSessionState.updatedAt) : "n/a",
+    captchaSessionState.useCount,
+  );
+  captchaSessionState.captchaVerifyParam = null;
+  captchaSessionState.updatedAt = null;
+  captchaSessionState.useCount = 0;
+}
+
+function isUpstreamCaptchaError(errObj: UpstreamError | null | undefined): boolean {
+  if (!errObj) return false;
+  const code = String(errObj.code ?? "");
+  const errorCode = String(errObj.error_code ?? "");
+  const captchaErrorType = String(errObj.captcha_error_type ?? "");
+  const verifyCode = String(errObj.verify_code ?? "");
+  const detail = String(errObj.detail ?? "");
+  return (
+    code === "FRONTEND_CAPTCHA_REQUIRED" ||
+    errorCode === "FRONTEND_CAPTCHA_REQUIRED" ||
+    captchaErrorType.length > 0 ||
+    verifyCode.length > 0 ||
+    detail.includes("人机验证") ||
+    /captcha/i.test(detail)
+  );
+}
+
+type WorkerJsonResponse = Record<string, unknown> & {
+  ok?: boolean;
+  request_id?: string | null;
+  error?: string;
+  payload?: Record<string, unknown> | null;
+  worker?: Record<string, unknown>;
+};
+
+class HiddenPureCodeWorkerBridge {
+  private process: Deno.ChildProcess | null = null;
+  private processPid: number | null = null;
+  private stdinWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
+  private pending = new Map<
+    string,
+    {
+      resolve: (value: WorkerJsonResponse) => void;
+      reject: (reason?: unknown) => void;
+      timeoutId: number;
+    }
+  >();
+  private stdoutLoop: Promise<void> | null = null;
+  private stderrLoop: Promise<void> | null = null;
+  private startupPromise: Promise<void> | null = null;
+  private lastReadyPayload: Record<string, unknown> | null = null;
+  private lastStdErrLine: string | null = null;
+  private staleCleanupAttempted = false;
+
+  private disposeProcess(reason = "manual-reset") {
+    const oldPid = this.processPid;
+    if (this.stdinWriter) {
+      try {
+        this.stdinWriter.releaseLock();
+      } catch (_err) {
+        // ignore
+      }
+    }
+    if (this.process) {
+      try {
+        this.process.kill("SIGKILL");
+      } catch (_err) {
+        // ignore
+      }
+    }
+    if (oldPid) {
+      try {
+        Deno.kill(oldPid, "SIGKILL");
+      } catch (_err) {
+        // ignore; process may already be gone
+      }
+    }
+    for (const [requestId, pending] of this.pending.entries()) {
+      clearTimeout(pending.timeoutId);
+      pending.reject(new Error(`pure-code worker reset: ${reason}`));
+      this.pending.delete(requestId);
+    }
+    this.process = null;
+    this.processPid = null;
+    this.stdinWriter = null;
+    this.startupPromise = null;
+  }
+
+  private async readLines(
+    stream: ReadableStream<Uint8Array>,
+    onLine: (line: string) => void,
+  ): Promise<void> {
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split(/\r?\n/);
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          if (line.trim()) onLine(line);
+        }
+      }
+      if (buffer.trim()) onLine(buffer);
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
+  private async ensureStarted(): Promise<void> {
+    if (this.process && this.stdinWriter) return;
+    if (this.startupPromise) return await this.startupPromise;
+
+    this.startupPromise = (async () => {
+      if (!this.staleCleanupAttempted && AUTO_CAPTCHA_PURE_CODE_CLEAN_STALE_WORKERS) {
+        this.staleCleanupAttempted = true;
+        try {
+          const cleanup = new Deno.Command("bash", {
+            args: [
+              "-lc",
+              "pids=$(ps -eo pid=,cmd= | awk '/node tools\\/pure_code_captcha_worker\\.js/ && !/awk/ {print $1}'); if [ -n \"$pids\" ]; then echo \"$pids\" | xargs -r kill; fi",
+            ],
+            stdout: "null",
+            stderr: "null",
+          }).spawn();
+          await cleanup.status;
+          debugLog("pure-code worker 启动前已尝试清理残留进程");
+        } catch (error) {
+          debugLog("pure-code worker 残留进程清理失败: %s", String(error));
+        }
+      }
+
+      const command = new Deno.Command("node", {
+        args: [
+          `--max-old-space-size=${AUTO_CAPTCHA_PURE_CODE_WORKER_MAX_OLD_SPACE_MB}`,
+          "tools/pure_code_captcha_worker.js",
+        ],
+        stdin: "piped",
+        stdout: "piped",
+        stderr: "piped",
+      });
+      const child = command.spawn();
+      this.process = child;
+      this.processPid = child.pid;
+      this.stdinWriter = child.stdin.getWriter();
+      debugLog(
+        "pure-code worker started: pid=%d max_old_space_mb=%d",
+        child.pid,
+        AUTO_CAPTCHA_PURE_CODE_WORKER_MAX_OLD_SPACE_MB,
+      );
+
+      this.stdoutLoop = this.readLines(child.stdout, (line) => {
+        try {
+          const payload = JSON.parse(line) as WorkerJsonResponse;
+          if (payload.ready) {
+            this.lastReadyPayload = payload;
+            return;
+          }
+          const requestId = typeof payload.request_id === "string" ? payload.request_id : null;
+          if (requestId && this.pending.has(requestId)) {
+            const pending = this.pending.get(requestId)!;
+            clearTimeout(pending.timeoutId);
+            this.pending.delete(requestId);
+            pending.resolve(payload);
+            return;
+          }
+          this.lastReadyPayload = payload;
+        } catch (_err) {
+          debugLog("pure-code worker stdout(非JSON): %s", line);
+        }
+      });
+
+      this.stderrLoop = this.readLines(child.stderr, (line) => {
+        this.lastStdErrLine = line;
+        debugLog("pure-code worker stderr: %s", line);
+      });
+
+      child.status.then((status) => {
+        const err = new Error(`pure-code worker exited: code=${status.code}`);
+        for (const [requestId, pending] of this.pending.entries()) {
+          clearTimeout(pending.timeoutId);
+          pending.reject(err);
+          this.pending.delete(requestId);
+        }
+        this.process = null;
+        this.processPid = null;
+        this.stdinWriter = null;
+      }).catch((err) => {
+        debugLog("pure-code worker status error: %v", err);
+      });
+    })();
+
+    try {
+      await this.startupPromise;
+    } finally {
+      this.startupPromise = null;
+    }
+  }
+
+  private async request(
+    payload: Record<string, unknown>,
+    timeoutMs = AUTO_CAPTCHA_PURE_CODE_TIMEOUT_MS,
+  ): Promise<WorkerJsonResponse> {
+    await this.ensureStarted();
+    if (!this.stdinWriter) {
+      throw new Error("pure-code worker stdin unavailable");
+    }
+    const requestId = String(payload.request_id || crypto.randomUUID());
+    const finalPayload = { ...payload, request_id: requestId };
+    const line = `${JSON.stringify(finalPayload)}\n`;
+
+    return await new Promise<WorkerJsonResponse>((resolve, reject) => {
+      const timeoutId = setTimeout(() => {
+        this.pending.delete(requestId);
+        this.disposeProcess(`timeout:${requestId}`);
+        reject(new Error(`pure-code worker request timeout: ${requestId}`));
+      }, timeoutMs) as unknown as number;
+
+      this.pending.set(requestId, { resolve, reject, timeoutId });
+      this.stdinWriter!.write(new TextEncoder().encode(line)).catch((err) => {
+        clearTimeout(timeoutId);
+        this.pending.delete(requestId);
+        reject(err);
+      });
+    });
+  }
+
+  async fetchCaptchaPayload(
+    token: string,
+    options: Record<string, unknown> | null = null,
+  ): Promise<Record<string, unknown> | null> {
+    const response = await this.request({
+      action: "captcha",
+      token,
+      options,
+    });
+    if (!response.ok) {
+      throw new Error(response.error || "pure-code worker returned not ok");
+    }
+    return response.payload || null;
+  }
+
+  async probe(includeRaw = false): Promise<WorkerJsonResponse> {
+    return await this.request({
+      action: "probe",
+      include_raw: includeRaw,
+    });
+  }
+
+  async warm(): Promise<WorkerJsonResponse> {
+    return await this.request({ action: "warm" });
+  }
+
+  async status(): Promise<WorkerJsonResponse> {
+    return await this.request({ action: "status" });
+  }
+
+  reset(reason = "manual") {
+    this.disposeProcess(reason);
+  }
+
+  snapshot() {
+    return {
+      running: !!this.process,
+      has_ready_payload: !!this.lastReadyPayload,
+      last_stderr_line: this.lastStdErrLine,
+      pending_requests: this.pending.size,
+      ready_payload: this.lastReadyPayload,
+    };
+  }
+}
+
+const pureCodeWorkerBridge = new HiddenPureCodeWorkerBridge();
+
+function shouldAttemptAutoCaptcha(modelId: string): boolean {
+  return AUTO_CAPTCHA_PURE_CODE_ENABLED && AUTO_CAPTCHA_MODEL_REGEX.test(modelId);
+}
+
+function formatBrowserDateTime(date: Date): string {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: BROWSER_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+  const parts = formatter.formatToParts(date);
+  const partMap = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${partMap.year}-${partMap.month}-${partMap.day} ${partMap.hour}:${partMap.minute}:${partMap.second}`;
+}
+
+function decodeJwtPayload(token: string): Record<string, unknown> | null {
+  try {
+    const tokenParts = token.split(".");
+    if (tokenParts.length !== 3) {
+      return null;
+    }
+    return JSON.parse(new TextDecoder().decode(decodeBase64(tokenParts[1])));
+  } catch (_error) {
+    return null;
+  }
+}
+
+function getBrowserUserName(
+  token: string,
+  profile?: { name?: string | null; email?: string | null } | null,
+): string {
+  if (UPSTREAM_BROWSER_USER_NAME) {
+    return UPSTREAM_BROWSER_USER_NAME;
+  }
+  const profileName = typeof profile?.name === "string" ? profile.name.trim() : "";
+  if (profileName) {
+    return profileName;
+  }
+  const importedProfileName = typeof IMPORTED_BROWSER_CAPTURE_STATE.profileName === "string"
+    ? IMPORTED_BROWSER_CAPTURE_STATE.profileName.trim()
+    : "";
+  if (importedProfileName) {
+    return importedProfileName;
+  }
+  const payload = decodeJwtPayload(token);
+  const name = typeof payload?.name === "string" ? payload.name.trim() : "";
+  if (name) {
+    return name;
+  }
+  const profileEmail = typeof profile?.email === "string" ? profile.email.trim() : "";
+  if (profileEmail) {
+    return profileEmail.split("@")[0] || profileEmail;
+  }
+  const email = typeof payload?.email === "string" ? payload.email.trim() : "";
+  if (email) {
+    return email.split("@")[0] || email;
+  }
+  return `Guest-${Date.now()}`;
+}
+
+function formatBrowserWeekday(date: Date): string {
+  return new Intl.DateTimeFormat("en-US", {
+    weekday: "long",
+    timeZone: BROWSER_TIMEZONE,
+  }).format(date);
+}
+
+async function tryAttachCaptchaVerifyParam(
+  upstreamReq: UpstreamRequest,
+  authToken: string,
+  modelId: string,
+): Promise<void> {
+  const shouldAttempt = shouldAttemptAutoCaptcha(modelId);
+  debugLog(
+    "captcha attach 检查: model=%s shouldAttempt=%s hasExisting=%s",
+    modelId,
+    String(shouldAttempt),
+    String(!!upstreamReq.captcha_verify_param),
+  );
+  if (upstreamReq.captcha_verify_param) {
+    return;
+  }
+
+  if (hasReusableCaptchaVerifyParam(authToken)) {
+    upstreamReq.captcha_verify_param = captchaSessionState.captchaVerifyParam!;
+    markCaptchaVerifyParamConsumed("reuse");
+    debugLog("复用缓存 captcha_verify_param: source=%s", captchaSessionState.source);
+    return;
+  }
+
+  if (!shouldAttempt) {
+    return;
+  }
+
+  try {
+    const payload = await getFreshCaptchaPayload(authToken, upstreamReq.chat_id || "");
+    const captchaVerifyParam = typeof payload?.captcha_verify_param === "string"
+      ? payload.captcha_verify_param
+      : null;
+    const payloadSource = typeof payload?.source === "string" ? payload.source : null;
+    if (!captchaVerifyParam) {
+      debugLog("pure-code worker 未返回可用 captcha_verify_param (source=%s)", payloadSource);
+      return;
+    }
+    if (
+      payloadSource !== "pure-code-worker-live-verify" &&
+      payloadSource !== "pure-code-worker-compact-live-replay"
+    ) {
+      debugLog("忽略非真实 live 验证来源的 captcha_verify_param: source=%s", payloadSource);
+      return;
+    }
+    upstreamReq.captcha_verify_param = captchaVerifyParam;
+    updateCaptchaSessionState({
+      captchaVerifyParam,
+      token: authToken,
+      source: "pure-code-worker",
+      workerLastPayloadSource: payloadSource,
+      workerLastError: null,
+    });
+    markCaptchaVerifyParamConsumed("fresh");
+    debugLog("已注入 pure-code captcha_verify_param: %s", captchaVerifyParam.slice(0, 32));
+  } catch (error) {
+    const message = String(error && (error as Error).stack || error);
+    updateCaptchaSessionState({
+      workerLastError: message,
+    });
+    debugLog("pure-code worker 获取 captcha 失败: %s", message);
+  }
+}
+
+async function getFreshCaptchaPayload(
+  authToken: string,
+  refererChatID = "",
+): Promise<Record<string, unknown> | null> {
+  const dedupeKey = `${authToken || "anonymous"}:${refererChatID}`;
+  const pending = pendingCaptchaFetches.get(dedupeKey);
+  if (pending) {
+    return await pending;
+  }
+
+  const job = (async () => {
+    captchaSessionState.lastWorkerAttemptAt = Date.now();
+    let lastError: unknown = null;
+
+    let sessionCookieHeader = "";
+    try {
+      const session = await upstreamSessionBootstrap.ensureSession(authToken, refererChatID);
+      sessionCookieHeader = session.cookieHeader || "";
+      debugLog(
+        "captcha worker session 已准备: refererChatID=%s cookie_keys=%s",
+        refererChatID,
+        sessionCookieHeader ? listCookieKeysFromHeader(sessionCookieHeader).join(",") : "",
+      );
+    } catch (sessionError) {
+      debugLog("captcha 前置 session bootstrap 失败: %v", sessionError);
+    }
+
+    const workerOptions: Record<string, unknown> = {
+      mutateInitAliyunCaptchaConfig: true,
+      initialAliyunCaptchaConfig: {
+        region: "sgp",
+        prefix: "no8xfe",
+      },
+      requestUrlRewriteMap: {
+        "https://no8xfe.captcha-open.aliyuncs.com/": "https://no8xfe.captcha-open-southeast.aliyuncs.com/",
+        "https://upload.captcha-open.aliyuncs.com/": "https://upload.captcha-open-southeast.aliyuncs.com/",
+      },
+      locationHref: refererChatID ? `${ORIGIN_BASE}/c/${refererChatID}` : ORIGIN_BASE,
+      referrer: refererChatID ? `${ORIGIN_BASE}/c/${refererChatID}` : `${ORIGIN_BASE}/`,
+      localStorageSeed: {
+        token: authToken,
+      },
+      navigatorOverrides: {
+        userAgent: getPreferredBrowserUserAgent(),
+        appVersion: getPreferredBrowserUserAgent().replace(/^Mozilla\//, ""),
+        platform: BROWSER_NAVIGATOR_PLATFORM,
+        language: "en-US",
+        webdriver: false,
+        maxTouchPoints: 0,
+      },
+      navigatorLanguages: ["en-US", "en"],
+      screenOverrides: {
+        width: Number(getPreferredBrowserScreenWidth()),
+        height: Number(getPreferredBrowserScreenHeight()),
+        availWidth: Number(getPreferredBrowserScreenWidth()),
+        availHeight: Number(getPreferredBrowserScreenHeight()),
+        colorDepth: Number(getPreferredBrowserColorDepth()),
+        pixelDepth: Number(getPreferredBrowserColorDepth()),
+      },
+      autoInitLanguage: "en",
+      autoInitConfig: {
+        language: "en",
+        upLang: true,
+      },
+      requestHeaders: {
+        "Accept": "*/*",
+        "User-Agent": getPreferredBrowserUserAgent(),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Priority": "u=1, i",
+        "Referer": "",
+        "Sec-Ch-Ua": getPreferredSecChUa(),
+        "Sec-Ch-Ua-Mobile": getPreferredSecChUaMobile(),
+        "Sec-Ch-Ua-Platform": getPreferredSecChUaPlatform(),
+      },
+    };
+    if (sessionCookieHeader) {
+      workerOptions.documentCookie = sessionCookieHeader;
+      workerOptions.cookieSeed = cookieHeaderToObject(sessionCookieHeader);
+    }
+    if (IMPORTED_BROWSER_CAPTURE_LATEST_CERTIFY_ID) {
+      workerOptions.fallbackCertifyId = IMPORTED_BROWSER_CAPTURE_LATEST_CERTIFY_ID;
+    }
+    debugLog(
+      "captcha worker options: hasCookie=%s fallbackCertifyId=%s ua=%s lang=%s tz=%s viewport=%sx%s",
+      String(!!sessionCookieHeader),
+      IMPORTED_BROWSER_CAPTURE_LATEST_CERTIFY_ID || "",
+      getPreferredBrowserUserAgent(),
+      getPreferredBrowserLanguage(),
+      getPreferredBrowserTimezone(),
+      getPreferredBrowserViewportWidth(),
+      getPreferredBrowserViewportHeight(),
+    );
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      let shouldResetWorker = false;
+      try {
+        const payload = await pureCodeWorkerBridge.fetchCaptchaPayload(authToken, workerOptions);
+        const captchaVerifyParam = typeof payload?.captcha_verify_param === "string"
+          ? payload.captcha_verify_param
+          : null;
+        if (captchaVerifyParam) {
+          return payload;
+        }
+        lastError = new Error(`empty captcha payload on attempt ${attempt}`);
+        debugLog("pure-code worker 未返回 captcha_verify_param，准备重试: attempt=%d", attempt);
+      } catch (error) {
+        lastError = error;
+        shouldResetWorker = true;
+        debugLog("pure-code worker 获取 captcha 失败，准备重试: attempt=%d error=%s", attempt, String(error));
+      }
+
+      if (attempt === 1 && shouldResetWorker) {
+        pureCodeWorkerBridge.reset("captcha-retry");
+      }
+    }
+
+    if (lastError) {
+      throw lastError;
+    }
+    return null;
+  })();
+
+  pendingCaptchaFetches.set(dedupeKey, job);
+  try {
+    return await job;
+  } finally {
+    pendingCaptchaFetches.delete(dedupeKey);
+  }
+}
 
 /**
  * 全局状态变量
@@ -1501,35 +2451,1464 @@ function validateApiKey(authHeader: string | null): boolean {
   return apiKey === DEFAULT_KEY;
 }
 
-async function getAnonymousToken(): Promise<string> {
+function mergeSetCookieHeader(
+  existingCookieHeader: string,
+  setCookieHeader: string | null,
+): string {
+  const jar = new Map<string, string>();
+  for (const part of existingCookieHeader.split(";").map((item) => item.trim()).filter(Boolean)) {
+    const eq = part.indexOf("=");
+    if (eq === -1) continue;
+    jar.set(part.slice(0, eq), part.slice(eq + 1));
+  }
+  if (!setCookieHeader) {
+    return Array.from(jar.entries()).map(([k, v]) => `${k}=${v}`).join("; ");
+  }
+  const rawCookies = setCookieHeader
+    .split(/,(?=[^;]+=[^;]+)/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  for (const rawCookie of rawCookies) {
+    const pair = rawCookie.split(";", 1)[0]?.trim();
+    if (!pair) continue;
+    const eq = pair.indexOf("=");
+    if (eq === -1) continue;
+    jar.set(pair.slice(0, eq), pair.slice(eq + 1));
+  }
+  return Array.from(jar.entries()).map(([k, v]) => `${k}=${v}`).join("; ");
+}
+
+function maskToken(token: string): string {
+  if (!token) return "";
+  if (token.length <= 24) return token;
+  return `${token.slice(0, 12)}...${token.slice(-12)}`;
+}
+
+function summarizeCookieHeader(cookieHeader: string): string {
+  if (!cookieHeader) return "";
+  return cookieHeader
+    .split(";")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => part.split("=", 1)[0])
+    .join(",");
+}
+
+function mergeCookieHeaderValue(
+  existingCookieHeader: string,
+  cookieHeader: string | null | undefined,
+): string {
+  const jar = new Map<string, string>();
+  for (const part of existingCookieHeader.split(";").map((item) => item.trim()).filter(Boolean)) {
+    const eq = part.indexOf("=");
+    if (eq === -1) continue;
+    jar.set(part.slice(0, eq), part.slice(eq + 1));
+  }
+  if (!cookieHeader) {
+    return Array.from(jar.entries()).map(([k, v]) => `${k}=${v}`).join("; ");
+  }
+  for (const part of cookieHeader.split(";").map((item) => item.trim()).filter(Boolean)) {
+    const eq = part.indexOf("=");
+    if (eq === -1) continue;
+    jar.set(part.slice(0, eq), part.slice(eq + 1));
+  }
+  return Array.from(jar.entries()).map(([k, v]) => `${k}=${v}`).join("; ");
+}
+
+function mergeCookieHeaders(...cookieHeaders: Array<string | null | undefined>): string {
+  let merged = "";
+  for (const cookieHeader of cookieHeaders) {
+    if (!cookieHeader) continue;
+    merged = mergeCookieHeaderValue(merged, cookieHeader);
+  }
+  return merged;
+}
+
+function cookieHeaderToObject(cookieHeader: string): Record<string, string> {
+  const jar: Record<string, string> = {};
+  if (!cookieHeader) return jar;
+  for (const part of cookieHeader.split(";").map((item) => item.trim()).filter(Boolean)) {
+    const eq = part.indexOf("=");
+    if (eq === -1) continue;
+    const key = part.slice(0, eq).trim();
+    const value = part.slice(eq + 1);
+    if (!key) continue;
+    jar[key] = value;
+  }
+  return jar;
+}
+
+function listCookieKeysFromHeader(cookieHeader: string): string[] {
+  return Object.keys(cookieHeaderToObject(cookieHeader));
+}
+
+const IMPORTED_BROWSER_COOKIE_ALLOWLIST = new Set([
+  "acw_tc",
+  "cdn_sec_tc",
+  "token",
+  "_c_WBKFRo",
+  "_nb_ioWEgULi",
+  "ssxmod_itna",
+  "ssxmod_itna2",
+  "_ga",
+  "_ga_Z8QTHYBHP3",
+  "_gcl_au",
+]);
+
+const STRICT_IMPORTED_BROWSER_COOKIE_ALLOWLIST =
+  (Deno.env.get("UPSTREAM_BROWSER_COOKIE_STRICT_ALLOWLIST") || "").trim().toLowerCase() === "true";
+
+interface BrowserCaptureState {
+  cookieHeader: string;
+  token: string;
+  profileId?: string;
+  profileEmail?: string;
+  profileName?: string;
+  profileRole?: string;
+  requestProfile?: Partial<BrowserRequestProfile>;
+  fingerprintProfile?: Record<string, string>;
+}
+
+function sanitizeCapturedCertifyId(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === "null" || trimmed === "undefined" || isRedactedCaptureValue(trimmed)) {
+    return "";
+  }
+  return trimmed;
+}
+
+function pickLatestCertifyIdFromCaptureRecord(input: unknown): string {
+  const seen: string[] = [];
+
+  const collectFromPlainObject = (record: Record<string, unknown>) => {
+    for (const key of ["CertifyId", "certifyId", "UserCertifyId", "userCertifyId", "cid", "cId"]) {
+      const value = sanitizeCapturedCertifyId(record[key]);
+      if (value) seen.push(value);
+    }
+  };
+
+  const collectFromRequestLike = (record: Record<string, unknown>) => {
+    const postData = typeof record.postData === "string"
+      ? record.postData
+      : typeof record.body === "string"
+      ? record.body
+      : "";
+    if (!postData || !postData.includes("=")) return;
+    try {
+      const params = new URLSearchParams(postData);
+      for (const key of ["CertifyId", "certifyId", "UserCertifyId", "userCertifyId", "cid", "cId"]) {
+        const value = sanitizeCapturedCertifyId(params.get(key));
+        if (value) seen.push(value);
+      }
+      const captchaVerifyParam = params.get("CaptchaVerifyParam");
+      if (captchaVerifyParam) {
+        try {
+          collectFromPlainObject(JSON.parse(captchaVerifyParam) as Record<string, unknown>);
+        } catch {
+          // ignore malformed embedded captcha payloads
+        }
+      }
+    } catch {
+      // ignore malformed form payloads
+    }
+  };
+
+  const collectFromJsonBody = (raw: string) => {
+    const trimmed = raw.trim();
+    if (!trimmed || !trimmed.startsWith("{")) return;
+    try {
+      walk(JSON.parse(trimmed));
+    } catch {
+      // ignore malformed embedded json
+    }
+  };
+
+  const walk = (value: unknown) => {
+    if (!value || typeof value !== "object") return;
+    if (Array.isArray(value)) {
+      for (const item of value) walk(item);
+      return;
+    }
+    const record = value as Record<string, unknown>;
+    collectFromPlainObject(record);
+    collectFromRequestLike(record);
+    if (typeof record.responseBody === "string") collectFromJsonBody(record.responseBody);
+    if (typeof record.body === "string" && record.type === "response_body") collectFromJsonBody(record.body);
+    const response = record.response && typeof record.response === "object"
+      ? record.response as Record<string, unknown>
+      : null;
+    if (response) {
+      collectFromPlainObject(response);
+      const content = response.content && typeof response.content === "object"
+        ? response.content as Record<string, unknown>
+        : null;
+      if (typeof content?.text === "string") collectFromJsonBody(content.text);
+    }
+    const request = record.request && typeof record.request === "object"
+      ? record.request as Record<string, unknown>
+      : null;
+    if (request) {
+      collectFromPlainObject(request);
+      collectFromRequestLike(request);
+      if (typeof request.postData === "object" && request.postData) {
+        const postDataRecord = request.postData as Record<string, unknown>;
+        if (typeof postDataRecord.text === "string") {
+          collectFromRequestLike({ postData: postDataRecord.text });
+        }
+      }
+    }
+    if (Array.isArray(record.requestDetails)) {
+      for (const item of record.requestDetails) walk(item);
+    }
+    const logRecord = record.log && typeof record.log === "object"
+      ? record.log as Record<string, unknown>
+      : null;
+    if (Array.isArray(logRecord?.entries)) {
+      for (const entry of logRecord.entries as unknown[]) walk(entry);
+    }
+  };
+
+  walk(input);
+  return seen.length > 0 ? seen[seen.length - 1] : "";
+}
+
+interface BrowserRequestProfile {
+  userAgent: string;
+  acceptLanguage: string;
+  secChUa: string;
+  secChUaMobile: string;
+  secChUaPlatform: string;
+}
+
+function isRedactedCaptureValue(value: string): boolean {
+  const normalized = value.trim();
+  if (!normalized) return true;
+  if (/^\[(redacted|masked)\]$/i.test(normalized)) return true;
+  if (normalized.includes("[REDACTED]") || normalized.includes("[TRUNCATED]")) return true;
+  return false;
+}
+
+function filterCookieHeaderByAllowlist(cookieHeader: string): string {
+  if (!cookieHeader) return "";
+  const jar = new Map<string, string>();
+  for (const part of cookieHeader.split(";").map((item) => item.trim()).filter(Boolean)) {
+    const eq = part.indexOf("=");
+    if (eq === -1) continue;
+    const key = part.slice(0, eq).trim();
+    if (!key) continue;
+    if (STRICT_IMPORTED_BROWSER_COOKIE_ALLOWLIST && !IMPORTED_BROWSER_COOKIE_ALLOWLIST.has(key)) {
+      continue;
+    }
+    jar.set(key, part.slice(eq + 1));
+  }
+  return Array.from(jar.entries()).map(([k, v]) => `${k}=${v}`).join("; ");
+}
+
+function extractTokenFromCookieHeader(cookieHeader: string): string {
+  if (!cookieHeader) return "";
+  for (const part of cookieHeader.split(";").map((item) => item.trim()).filter(Boolean)) {
+    const eq = part.indexOf("=");
+    if (eq === -1) continue;
+    const key = part.slice(0, eq).trim().toLowerCase();
+    if (key !== "token") continue;
+    return part.slice(eq + 1).trim();
+  }
+  return "";
+}
+
+function extractCookieHeaderFromUnknownCapture(input: unknown): string {
+  if (!input || typeof input !== "object") return "";
+  const record = input as Record<string, unknown>;
+  const directCookie = typeof record.cookie === "string" ? record.cookie : "";
+  if (directCookie && !isRedactedCaptureValue(directCookie) && directCookie.includes("=")) {
+    return directCookie;
+  }
+  const state = record.state && typeof record.state === "object"
+    ? record.state as Record<string, unknown>
+    : null;
+  if (
+    state && typeof state.cookie === "string" && state.cookie &&
+    !isRedactedCaptureValue(state.cookie) &&
+    state.cookie.includes("=")
+  ) {
+    return state.cookie;
+  }
+  const headers = record.headers && typeof record.headers === "object"
+    ? record.headers as Record<string, unknown>
+    : null;
+  if (headers) {
+    const normalizedHeaders = headersToObject(headers);
+    const fromHeaders = typeof normalizedHeaders.Cookie === "string"
+      ? normalizedHeaders.Cookie
+      : typeof normalizedHeaders.cookie === "string"
+      ? normalizedHeaders.cookie
+      : "";
+    if (fromHeaders && !isRedactedCaptureValue(fromHeaders) && fromHeaders.includes("=")) {
+      return fromHeaders;
+    }
+  }
+  const requestHeaders = record.requestHeaders && typeof record.requestHeaders === "object"
+    ? record.requestHeaders as Record<string, unknown>
+    : null;
+  if (requestHeaders) {
+    const normalizedHeaders = headersToObject(requestHeaders);
+    const fromRequestHeaders = typeof normalizedHeaders.Cookie === "string"
+      ? normalizedHeaders.Cookie
+      : typeof normalizedHeaders.cookie === "string"
+      ? normalizedHeaders.cookie
+      : "";
+    if (fromRequestHeaders && !isRedactedCaptureValue(fromRequestHeaders) && fromRequestHeaders.includes("=")) {
+      return fromRequestHeaders;
+    }
+  }
+  const requestRecord = record.request && typeof record.request === "object"
+    ? record.request as Record<string, unknown>
+    : null;
+  if (requestRecord) {
+    const normalizedHeaders = headersToObject(requestRecord.headers);
+    const fromRequestHeaders = typeof normalizedHeaders.Cookie === "string"
+      ? normalizedHeaders.Cookie
+      : typeof normalizedHeaders.cookie === "string"
+      ? normalizedHeaders.cookie
+      : "";
+    if (fromRequestHeaders && !isRedactedCaptureValue(fromRequestHeaders) && fromRequestHeaders.includes("=")) {
+      return fromRequestHeaders;
+    }
+  }
+  return "";
+}
+
+function headersToObject(input: unknown): Record<string, string> {
+  if (!input) return {};
+  if (Array.isArray(input)) {
+    const out: Record<string, string> = {};
+    for (const item of input) {
+      if (!item || typeof item !== "object") continue;
+      const row = item as Record<string, unknown>;
+      const name = typeof row.name === "string" ? row.name.trim() : "";
+      const value = typeof row.value === "string" ? row.value : "";
+      if (!name || !value) continue;
+      out[name] = value;
+    }
+    return out;
+  }
+  if (typeof input === "object") {
+    return input as Record<string, string>;
+  }
+  return {};
+}
+
+function extractTokenFromUnknownCapture(input: unknown): string {
+  if (!input || typeof input !== "object") return "";
+  const record = input as Record<string, unknown>;
+  const directToken = typeof record.token === "string" ? record.token.trim() : "";
+  if (directToken && !isRedactedCaptureValue(directToken)) {
+    return directToken;
+  }
+  const state = record.state && typeof record.state === "object"
+    ? record.state as Record<string, unknown>
+    : null;
+  if (
+    state && typeof state.localStorageToken === "string" && state.localStorageToken.trim() &&
+    !isRedactedCaptureValue(state.localStorageToken)
+  ) {
+    return state.localStorageToken.trim();
+  }
+  if (state && typeof state.token === "string" && state.token.trim() && !isRedactedCaptureValue(state.token)) {
+    return state.token.trim();
+  }
+  const requestHeaders = record.requestHeaders && typeof record.requestHeaders === "object"
+    ? record.requestHeaders as Record<string, unknown>
+    : null;
+  if (requestHeaders) {
+    const normalizedHeaders = headersToObject(requestHeaders);
+    const authHeader = typeof normalizedHeaders.Authorization === "string"
+      ? normalizedHeaders.Authorization
+      : typeof normalizedHeaders.authorization === "string"
+      ? normalizedHeaders.authorization
+      : "";
+    if (!isRedactedCaptureValue(authHeader) && authHeader.toLowerCase().startsWith("bearer ")) {
+      return authHeader.slice(7).trim();
+    }
+    const cookieHeader = typeof normalizedHeaders.Cookie === "string"
+      ? normalizedHeaders.Cookie
+      : typeof normalizedHeaders.cookie === "string"
+      ? normalizedHeaders.cookie
+      : "";
+    const tokenFromCookie = extractTokenFromCookieHeader(cookieHeader);
+    if (tokenFromCookie) {
+      return tokenFromCookie;
+    }
+  }
+  const headers = record.headers && typeof record.headers === "object"
+    ? record.headers as Record<string, unknown>
+    : null;
+  if (headers) {
+    const normalizedHeaders = headersToObject(headers);
+    const authHeader = typeof normalizedHeaders.Authorization === "string"
+      ? normalizedHeaders.Authorization
+      : typeof normalizedHeaders.authorization === "string"
+      ? normalizedHeaders.authorization
+      : "";
+    if (!isRedactedCaptureValue(authHeader) && authHeader.toLowerCase().startsWith("bearer ")) {
+      return authHeader.slice(7).trim();
+    }
+  }
+  const requestRecord = record.request && typeof record.request === "object"
+    ? record.request as Record<string, unknown>
+    : null;
+  if (requestRecord) {
+    const normalizedHeaders = headersToObject(requestRecord.headers);
+    const authHeader = typeof normalizedHeaders.Authorization === "string"
+      ? normalizedHeaders.Authorization
+      : typeof normalizedHeaders.authorization === "string"
+      ? normalizedHeaders.authorization
+      : "";
+    if (!isRedactedCaptureValue(authHeader) && authHeader.toLowerCase().startsWith("bearer ")) {
+      return authHeader.slice(7).trim();
+    }
+  }
+  return extractTokenFromCookieHeader(extractCookieHeaderFromUnknownCapture(record));
+}
+
+function extractProfileFromUnknownCapture(input: unknown): Partial<BrowserCaptureState> {
+  if (!input || typeof input !== "object") return {};
+  const record = input as Record<string, unknown>;
+  const state = record.state && typeof record.state === "object"
+    ? record.state as Record<string, unknown>
+    : null;
+  const localStorageToken = state && typeof state.localStorageToken === "string" &&
+      !isRedactedCaptureValue(state.localStorageToken)
+    ? state.localStorageToken.trim()
+    : "";
+  const pageTitle = state && typeof state.title === "string" && !isRedactedCaptureValue(state.title)
+    ? state.title.trim()
+    : "";
+  const pageHref = state && typeof state.href === "string" && !isRedactedCaptureValue(state.href)
+    ? state.href.trim()
+    : "";
+  const stateProfile: Partial<BrowserCaptureState> = localStorageToken || pageTitle || pageHref
+    ? {
+      ...(localStorageToken ? { token: localStorageToken } : {}),
+      ...(pageTitle ? { profileName: pageTitle } : {}),
+      ...(pageHref ? { profileEmail: pageHref } : {}),
+    }
+    : {};
+  const responseRecord = record.response && typeof record.response === "object"
+    ? record.response as Record<string, unknown>
+    : null;
+  const responseContent = responseRecord?.content && typeof responseRecord.content === "object"
+    ? responseRecord.content as Record<string, unknown>
+    : null;
+  const responseBody = typeof record.responseBody === "string"
+    ? record.responseBody.trim()
+    : typeof record.responseBodySummary === "string"
+    ? record.responseBodySummary.trim()
+    : typeof responseContent?.text === "string"
+    ? responseContent.text.trim()
+    : "";
+  if (!responseBody || !responseBody.startsWith("{")) {
+    return {};
+  }
   try {
-    const response = await fetch(`${ORIGIN_BASE}/api/v1/auths/`, {
+    const parsed = JSON.parse(responseBody) as Record<string, unknown>;
+    const token = typeof parsed.token === "string" && !isRedactedCaptureValue(parsed.token)
+      ? parsed.token
+      : "";
+    if (!token) {
+      return stateProfile;
+    }
+    return mergeBrowserCaptureStates(stateProfile, {
+      token,
+      profileId: typeof parsed.id === "string" ? parsed.id : "",
+      profileEmail: typeof parsed.email === "string" ? parsed.email : "",
+      profileName: typeof parsed.name === "string" ? parsed.name : "",
+      profileRole: typeof parsed.role === "string" ? parsed.role : "",
+    });
+  } catch {
+    return stateProfile;
+  }
+}
+
+function extractRequestProfileFromHeaders(headers: Record<string, string>): Partial<BrowserRequestProfile> {
+  const userAgent = typeof headers["User-Agent"] === "string"
+    ? headers["User-Agent"]
+    : typeof headers["user-agent"] === "string"
+    ? headers["user-agent"]
+    : "";
+  const acceptLanguage = typeof headers["Accept-Language"] === "string"
+    ? headers["Accept-Language"]
+    : typeof headers["accept-language"] === "string"
+    ? headers["accept-language"]
+    : "";
+  const secChUa = typeof headers["Sec-Ch-Ua"] === "string"
+    ? headers["Sec-Ch-Ua"]
+    : typeof headers["sec-ch-ua"] === "string"
+    ? headers["sec-ch-ua"]
+    : "";
+  const secChUaMobile = typeof headers["Sec-Ch-Ua-Mobile"] === "string"
+    ? headers["Sec-Ch-Ua-Mobile"]
+    : typeof headers["sec-ch-ua-mobile"] === "string"
+    ? headers["sec-ch-ua-mobile"]
+    : "";
+  const secChUaPlatform = typeof headers["Sec-Ch-Ua-Platform"] === "string"
+    ? headers["Sec-Ch-Ua-Platform"]
+    : typeof headers["sec-ch-ua-platform"] === "string"
+    ? headers["sec-ch-ua-platform"]
+    : "";
+  return {
+    ...(userAgent && !isRedactedCaptureValue(userAgent) ? { userAgent } : {}),
+    ...(acceptLanguage && !isRedactedCaptureValue(acceptLanguage) ? { acceptLanguage } : {}),
+    ...(secChUa && !isRedactedCaptureValue(secChUa) ? { secChUa } : {}),
+    ...(secChUaMobile && !isRedactedCaptureValue(secChUaMobile) ? { secChUaMobile } : {}),
+    ...(secChUaPlatform && !isRedactedCaptureValue(secChUaPlatform) ? { secChUaPlatform } : {}),
+  };
+}
+
+function extractFingerprintProfileFromUnknownCapture(input: unknown): Record<string, string> {
+  if (!input || typeof input !== "object") return {};
+  const record = input as Record<string, unknown>;
+  const state = record.state && typeof record.state === "object"
+    ? record.state as Record<string, unknown>
+    : null;
+  const stateHref = state && typeof state.href === "string" && !isRedactedCaptureValue(state.href)
+    ? state.href.trim()
+    : "";
+  const stateTitle = state && typeof state.title === "string" && !isRedactedCaptureValue(state.title)
+    ? state.title.trim()
+    : "";
+  const fromPageState: Record<string, string> = {};
+  if (stateHref) {
+    fromPageState.current_url = stateHref;
+    try {
+      const pageUrl = new URL(stateHref);
+      fromPageState.pathname = pageUrl.pathname;
+      fromPageState.referrer = pageUrl.search;
+    } catch {
+      // ignore malformed page URLs in captures
+    }
+  }
+  if (stateTitle) {
+    fromPageState.title = stateTitle;
+  }
+  const requestRecord = record.request && typeof record.request === "object"
+    ? record.request as Record<string, unknown>
+    : null;
+  const rawUrl = typeof record.url === "string"
+    ? record.url
+    : typeof requestRecord?.url === "string"
+    ? requestRecord.url
+    : "";
+  if (!rawUrl || !rawUrl.includes("/api/v2/chat/completions")) {
+    return fromPageState;
+  }
+  try {
+    const url = new URL(rawUrl);
+    const keys = [
+      "user_agent",
+      "language",
+      "languages",
+      "timezone",
+      "screen_width",
+      "screen_height",
+      "viewport_height",
+      "viewport_width",
+      "color_depth",
+      "pixel_ratio",
+      "timezone_offset",
+      "title",
+      "browser_name",
+      "os_name",
+      "current_url",
+      "pathname",
+      "referrer",
+    ];
+    const out: Record<string, string> = {};
+    for (const key of keys) {
+      const value = url.searchParams.get(key);
+      if (!value || isRedactedCaptureValue(value)) continue;
+      out[key] = value;
+    }
+    return { ...fromPageState, ...out };
+  } catch {
+    return fromPageState;
+  }
+}
+
+function mergeBrowserCaptureStates(...states: Array<Partial<BrowserCaptureState> | null | undefined>): BrowserCaptureState {
+  const merged: BrowserCaptureState = {
+    cookieHeader: "",
+    token: "",
+    profileId: "",
+    profileEmail: "",
+    profileName: "",
+    profileRole: "",
+    requestProfile: {},
+    fingerprintProfile: {},
+  };
+  for (const state of states) {
+    if (!state) continue;
+    if (typeof state.cookieHeader === "string" && state.cookieHeader) {
+      merged.cookieHeader = mergeCookieHeaders(merged.cookieHeader, state.cookieHeader);
+    }
+    if (typeof state.token === "string" && state.token) {
+      merged.token = state.token;
+    }
+    if (typeof state.profileId === "string" && state.profileId) {
+      merged.profileId = state.profileId;
+    }
+    if (typeof state.profileEmail === "string" && state.profileEmail) {
+      merged.profileEmail = state.profileEmail;
+    }
+    if (typeof state.profileName === "string" && state.profileName) {
+      merged.profileName = state.profileName;
+    }
+    if (typeof state.profileRole === "string" && state.profileRole) {
+      merged.profileRole = state.profileRole;
+    }
+    if (state.requestProfile && typeof state.requestProfile === "object") {
+      merged.requestProfile = { ...merged.requestProfile, ...state.requestProfile };
+    }
+    if (state.fingerprintProfile && typeof state.fingerprintProfile === "object") {
+      merged.fingerprintProfile = { ...merged.fingerprintProfile, ...state.fingerprintProfile };
+    }
+  }
+  merged.cookieHeader = filterCookieHeaderByAllowlist(merged.cookieHeader);
+  if (!merged.token) {
+    merged.token = extractTokenFromCookieHeader(merged.cookieHeader);
+  }
+  return merged;
+}
+
+function extractBrowserCaptureStateFromUnknownCapture(input: unknown): BrowserCaptureState {
+  if (!input || typeof input !== "object") {
+    return { cookieHeader: "", token: "" };
+  }
+  const record = input as Record<string, unknown>;
+  const direct = mergeBrowserCaptureStates({
+    cookieHeader: extractCookieHeaderFromUnknownCapture(record),
+    token: extractTokenFromUnknownCapture(record),
+    requestProfile: extractRequestProfileFromHeaders(headersToObject(record.requestHeaders || record.headers)),
+    fingerprintProfile: extractFingerprintProfileFromUnknownCapture(record),
+  }, extractProfileFromUnknownCapture(record));
+  const requestDetails = Array.isArray(record.requestDetails) ? record.requestDetails : [];
+  const harEntries = Array.isArray((record.log && typeof record.log === "object"
+    ? (record.log as Record<string, unknown>).entries
+    : null))
+    ? ((record.log as Record<string, unknown>).entries as unknown[])
+    : [];
+  const nested = requestDetails.map((item) =>
+    mergeBrowserCaptureStates({
+      cookieHeader: extractCookieHeaderFromUnknownCapture(item),
+      token: extractTokenFromUnknownCapture(item),
+      requestProfile: extractRequestProfileFromHeaders(headersToObject(
+        (item && typeof item === "object" ? (item as Record<string, unknown>).requestHeaders : null) ||
+        (item && typeof item === "object" ? (item as Record<string, unknown>).headers : null) ||
+        ((item && typeof item === "object" && (item as Record<string, unknown>).request &&
+          typeof (item as Record<string, unknown>).request === "object")
+          ? ((item as Record<string, unknown>).request as Record<string, unknown>).headers
+          : null),
+      )),
+      fingerprintProfile: extractFingerprintProfileFromUnknownCapture(item),
+    }, extractProfileFromUnknownCapture(item))
+  );
+  const harStates = harEntries.map((item) =>
+    mergeBrowserCaptureStates({
+      cookieHeader: extractCookieHeaderFromUnknownCapture(item),
+      token: extractTokenFromUnknownCapture(item),
+      requestProfile: extractRequestProfileFromHeaders(headersToObject(
+        (item && typeof item === "object" && (item as Record<string, unknown>).request &&
+          typeof (item as Record<string, unknown>).request === "object")
+          ? ((item as Record<string, unknown>).request as Record<string, unknown>).headers
+          : null,
+      )),
+      fingerprintProfile: extractFingerprintProfileFromUnknownCapture(item),
+    }, extractProfileFromUnknownCapture(item))
+  );
+  return mergeBrowserCaptureStates(direct, ...nested, ...harStates);
+}
+
+async function loadBrowserCaptureState(path: string): Promise<BrowserCaptureState> {
+  if (!path) return { cookieHeader: "", token: "" };
+  const capturePaths = await expandBrowserCapturePaths(path);
+  const mergedStates: BrowserCaptureState[] = [];
+  for (const capturePath of capturePaths) {
+    try {
+      const raw = await Deno.readTextFile(capturePath);
+      const candidates: BrowserCaptureState[] = [];
+      const trimmed = raw.trim();
+      if (!trimmed) continue;
+      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (Array.isArray(parsed)) {
+            for (const item of parsed) {
+              candidates.push(extractBrowserCaptureStateFromUnknownCapture(item));
+            }
+          } else {
+            candidates.push(extractBrowserCaptureStateFromUnknownCapture(parsed));
+          }
+        } catch {
+          // Some capture files are JSONL that start with "{" but contain multiple JSON objects.
+          for (const line of trimmed.split(/\r?\n/)) {
+            const text = line.trim();
+            if (!text.startsWith("{")) continue;
+            try {
+              const parsed = JSON.parse(text);
+              candidates.push(extractBrowserCaptureStateFromUnknownCapture(parsed));
+            } catch {
+              // ignore malformed jsonl line
+            }
+          }
+        }
+      } else {
+        for (const line of trimmed.split(/\r?\n/)) {
+          const text = line.trim();
+          if (!text.startsWith("{")) continue;
+          try {
+            const parsed = JSON.parse(text);
+            candidates.push(extractBrowserCaptureStateFromUnknownCapture(parsed));
+          } catch {
+            // ignore malformed jsonl line
+          }
+        }
+      }
+      const merged = mergeBrowserCaptureStates(...candidates);
+      mergedStates.push(merged);
+      if (merged.cookieHeader || merged.token) {
+        debugLog(
+          "已加载浏览器捕获会话: path=%s keys=%s token=%s profile=%s",
+          capturePath,
+          summarizeCookieHeader(merged.cookieHeader),
+          maskToken(merged.token),
+          merged.profileName || merged.profileEmail || "",
+        );
+      } else {
+        debugLog("浏览器捕获文件未提取到可用会话: path=%s", capturePath);
+      }
+    } catch (error) {
+      debugLog("加载浏览器捕获会话失败: path=%s error=%s", capturePath, String(error));
+    }
+  }
+  const finalState = mergeBrowserCaptureStates(...mergedStates);
+  if (!finalState.cookieHeader && !finalState.token) {
+    return { cookieHeader: "", token: "" };
+  }
+  return finalState;
+}
+
+async function loadLatestBrowserCaptureCertifyId(path: string): Promise<string> {
+  if (!path) return "";
+  const capturePaths = await expandBrowserCapturePaths(path);
+  let latestCertifyId = "";
+  for (const capturePath of capturePaths) {
+    try {
+      const raw = await Deno.readTextFile(capturePath);
+      const trimmed = raw.trim();
+      if (!trimmed) continue;
+      const records: unknown[] = [];
+      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (Array.isArray(parsed)) {
+            records.push(...parsed);
+          } else {
+            records.push(parsed);
+          }
+        } catch {
+          for (const line of trimmed.split(/\r?\n/)) {
+            const text = line.trim();
+            if (!text.startsWith("{")) continue;
+            try {
+              records.push(JSON.parse(text));
+            } catch {
+              // ignore malformed jsonl line
+            }
+          }
+        }
+      } else {
+        for (const line of trimmed.split(/\r?\n/)) {
+          const text = line.trim();
+          if (!text.startsWith("{")) continue;
+          try {
+            records.push(JSON.parse(text));
+          } catch {
+            // ignore malformed jsonl line
+          }
+        }
+      }
+      for (const record of records) {
+        const certifyId = pickLatestCertifyIdFromCaptureRecord(record);
+        if (certifyId) latestCertifyId = certifyId;
+      }
+      if (latestCertifyId) {
+        debugLog("已从浏览器捕获提取最新 CertifyId: path=%s certifyId=%s", capturePath, latestCertifyId);
+      }
+    } catch (error) {
+      debugLog("提取浏览器捕获 CertifyId 失败: path=%s error=%s", capturePath, String(error));
+    }
+  }
+  return latestCertifyId;
+}
+
+async function expandBrowserCapturePaths(pathSpec: string): Promise<string[]> {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const parts = pathSpec
+    .split(/[\n,]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  for (const rawPath of parts) {
+    await pushBrowserCapturePath(rawPath, out, seen);
+    if (rawPath.endsWith(".har")) {
+      await pushBrowserCapturePath(rawPath.slice(0, -4) + ".trace", out, seen);
+    } else if (rawPath.endsWith(".trace")) {
+      await pushBrowserCapturePath(rawPath.slice(0, -6) + ".har", out, seen);
+    }
+  }
+  return out;
+}
+
+async function pushBrowserCapturePath(
+  path: string,
+  out: string[],
+  seen: Set<string>,
+): Promise<void> {
+  if (!path || seen.has(path)) return;
+  try {
+    const stat = await Deno.stat(path);
+    if (!stat.isFile) return;
+    seen.add(path);
+    out.push(path);
+  } catch {
+    // ignore missing sibling capture files
+  }
+}
+
+async function hydrateBrowserCaptureStateViaAuths(
+  state: BrowserCaptureState,
+): Promise<BrowserCaptureState> {
+  if (!state?.cookieHeader) {
+    return state;
+  }
+  if (state.token && state.cookieHeader) {
+    return state;
+  }
+  try {
+    const headers = await SmartHeaderGenerator.generateHeaders("");
+    const response = await fetchWithCurlFallback(`${ORIGIN_BASE}/api/v1/auths/`, {
       method: "GET",
       headers: {
-        "User-Agent": BROWSER_UA,
+        ...headers,
         Accept: "*/*",
-        "Accept-Language": "zh-CN,zh;q=0.9",
-        "X-FE-Version": X_FE_VERSION,
-        "sec-ch-ua": SEC_CH_UA,
-        "sec-ch-ua-mobile": SEC_CH_UA_MOB,
-        "sec-ch-ua-platform": SEC_CH_UA_PLAT,
-        Origin: ORIGIN_BASE,
-        Referer: `${ORIGIN_BASE}/`,
+        Cookie: state.cookieHeader,
       },
-    });
-
+    }, "浏览器捕获会话补全 /api/v1/auths/");
     if (!response.ok) {
-      throw new Error(
-        `Anonymous token request failed with status ${response.status}`
+      debugLog(
+        "浏览器捕获会话补全失败: /api/v1/auths/ status=%d cookies=%s",
+        response.status,
+        summarizeCookieHeader(state.cookieHeader),
+      );
+      return state;
+    }
+    const parsed = (await response.json()) as {
+      token?: string;
+      id?: string;
+      email?: string;
+      name?: string;
+      role?: string;
+    };
+    const mergedCookieHeader = mergeCookieHeaders(
+      state.cookieHeader,
+      mergeSetCookieHeader("", response.headers.get("set-cookie")),
+      parsed?.token ? `token=${parsed.token}` : "",
+    );
+    const hydrated = mergeBrowserCaptureStates(state, {
+      cookieHeader: mergedCookieHeader,
+      token: parsed?.token || "",
+      profileId: parsed?.id || "",
+      profileEmail: parsed?.email || "",
+      profileName: parsed?.name || "",
+      profileRole: parsed?.role || "",
+    });
+    if (hydrated.token && hydrated.token !== state.token) {
+      debugLog(
+        "浏览器捕获会话已通过 /api/v1/auths/ 补全: token=%s profile=%s cookies=%s",
+        maskToken(hydrated.token),
+        hydrated.profileName || hydrated.profileEmail || "",
+        summarizeCookieHeader(hydrated.cookieHeader),
       );
     }
+    return hydrated;
+  } catch (error) {
+    debugLog("浏览器捕获会话补全异常: %s", String(error));
+    return state;
+  }
+}
 
-    const data = (await response.json()) as { token: string };
-    if (!data.token) {
-      throw new Error("Anonymous token is empty");
+const IMPORTED_BROWSER_CAPTURE_STATE = await hydrateBrowserCaptureStateViaAuths(
+  await loadBrowserCaptureState(UPSTREAM_BROWSER_COOKIE_CAPTURE_PATH),
+);
+const IMPORTED_BROWSER_CAPTURE_LATEST_CERTIFY_ID = await loadLatestBrowserCaptureCertifyId(
+  UPSTREAM_BROWSER_COOKIE_CAPTURE_PATH,
+);
+IMPORTED_BROWSER_REQUEST_PROFILE = {
+  ...(IMPORTED_BROWSER_CAPTURE_STATE.requestProfile || {}),
+};
+IMPORTED_BROWSER_FINGERPRINT_PROFILE = {
+  ...(IMPORTED_BROWSER_CAPTURE_STATE.fingerprintProfile || {}),
+};
+if (
+  Object.keys(IMPORTED_BROWSER_REQUEST_PROFILE).length > 0 ||
+  Object.keys(IMPORTED_BROWSER_FINGERPRINT_PROFILE).length > 0
+) {
+  debugLog(
+    "已导入浏览器画像: ua=%s lang=%s tz=%s viewport=%sx%s",
+    IMPORTED_BROWSER_REQUEST_PROFILE.userAgent || IMPORTED_BROWSER_FINGERPRINT_PROFILE.user_agent || "",
+    IMPORTED_BROWSER_REQUEST_PROFILE.acceptLanguage || IMPORTED_BROWSER_FINGERPRINT_PROFILE.language || "",
+    IMPORTED_BROWSER_FINGERPRINT_PROFILE.timezone || "",
+    IMPORTED_BROWSER_FINGERPRINT_PROFILE.viewport_width || "",
+    IMPORTED_BROWSER_FINGERPRINT_PROFILE.viewport_height || "",
+  );
+}
+if (IMPORTED_BROWSER_CAPTURE_LATEST_CERTIFY_ID) {
+  debugLog("已导入浏览器捕获最新 CertifyId: %s", IMPORTED_BROWSER_CAPTURE_LATEST_CERTIFY_ID);
+}
+type UpstreamSessionMode = "anonymous_guest" | "logged_in_cookie" | "configured_token";
+
+interface UpstreamBootstrapSession {
+  mode: UpstreamSessionMode;
+  cookieHeader: string;
+  authToken: string;
+  returnedAuthToken?: string;
+  profileId?: string;
+  profileEmail?: string;
+  profileName?: string;
+  profileRole?: string;
+  requestProfile?: Partial<BrowserRequestProfile>;
+  fingerprintProfile?: Record<string, string>;
+  updatedAt: number;
+  warmedUpAt?: number;
+}
+
+let anonymousBootstrapState: UpstreamBootstrapSession | null = null;
+let loggedInCookieBootstrapState: UpstreamBootstrapSession | null = null;
+
+function isGuestRole(role: string | null | undefined): boolean {
+  return String(role || "").trim().toLowerCase() === "guest";
+}
+
+function buildImportedSessionProfiles(): Pick<UpstreamBootstrapSession, "requestProfile" | "fingerprintProfile"> {
+  return {
+    requestProfile: { ...IMPORTED_BROWSER_REQUEST_PROFILE },
+    fingerprintProfile: { ...IMPORTED_BROWSER_FINGERPRINT_PROFILE },
+  };
+}
+
+function buildImportedCaptureBootstrapSession(
+  mode: UpstreamSessionMode,
+  authTokenOverride = "",
+  roleFallback = "",
+): UpstreamBootstrapSession | null {
+  if (!IMPORTED_BROWSER_CAPTURE_STATE.cookieHeader && !IMPORTED_BROWSER_CAPTURE_STATE.token) {
+    return null;
+  }
+  const importedToken = (IMPORTED_BROWSER_CAPTURE_STATE.token || "").trim();
+  const authToken = (authTokenOverride || importedToken).trim();
+  if (!authToken) {
+    return null;
+  }
+  const returnedAuthToken = importedToken || authToken;
+  return {
+    mode,
+    cookieHeader: mergeCookieHeaders(
+      IMPORTED_BROWSER_CAPTURE_STATE.cookieHeader || "",
+      UPSTREAM_EXTRA_COOKIE_HEADER,
+      returnedAuthToken ? `token=${returnedAuthToken}` : "",
+    ),
+    authToken,
+    returnedAuthToken,
+    profileId: IMPORTED_BROWSER_CAPTURE_STATE.profileId || "",
+    profileEmail: IMPORTED_BROWSER_CAPTURE_STATE.profileEmail || "",
+    profileName: IMPORTED_BROWSER_CAPTURE_STATE.profileName || "",
+    profileRole: IMPORTED_BROWSER_CAPTURE_STATE.profileRole || roleFallback,
+    ...buildImportedSessionProfiles(),
+    updatedAt: Date.now(),
+  };
+}
+
+function buildUpstreamBootstrapSession(
+  mode: UpstreamSessionMode,
+  authToken: string,
+  cookieHeader: string,
+  parsed: {
+    token?: string;
+    id?: string;
+    email?: string;
+    name?: string;
+    role?: string;
+  },
+): UpstreamBootstrapSession {
+  const returnedAuthToken = parsed.token || authToken;
+  return {
+    mode,
+    cookieHeader: mergeCookieHeaders(cookieHeader, returnedAuthToken ? `token=${returnedAuthToken}` : ""),
+    authToken,
+    returnedAuthToken,
+    profileId: parsed.id || "",
+    profileEmail: parsed.email || "",
+    profileName: parsed.name || "",
+    profileRole: parsed.role || "",
+    ...buildImportedSessionProfiles(),
+    updatedAt: Date.now(),
+  };
+}
+
+function findBootstrapSessionByToken(token: string): UpstreamBootstrapSession | null {
+  const candidates = [loggedInCookieBootstrapState, anonymousBootstrapState];
+  for (const session of candidates) {
+    if (!session) continue;
+    if (session.authToken === token || session.returnedAuthToken === token) {
+      return session;
     }
+  }
+  return null;
+}
 
-    return data.token;
+async function bootstrapAnonymousSession(): Promise<UpstreamBootstrapSession> {
+  if (anonymousBootstrapState && (Date.now() - anonymousBootstrapState.updatedAt) <= 25 * 60 * 1000) {
+    return anonymousBootstrapState;
+  }
+
+  const importedAnonymousSession = buildImportedCaptureBootstrapSession(
+    "anonymous_guest",
+    IMPORTED_BROWSER_CAPTURE_STATE.token || "",
+    "guest",
+  );
+  const headers = await SmartHeaderGenerator.generateHeaders("");
+  let cookieHeader = mergeCookieHeaders(
+    importedAnonymousSession?.cookieHeader,
+    UPSTREAM_EXTRA_COOKIE_HEADER,
+  );
+  if (importedAnonymousSession) {
+    debugLog(
+      "匿名 bootstrap 使用导入 capture 作为种子: token=%s cookies=%s profile=%s",
+      maskToken(importedAnonymousSession.authToken),
+      summarizeCookieHeader(importedAnonymousSession.cookieHeader),
+      importedAnonymousSession.profileName || importedAnonymousSession.profileEmail || "",
+    );
+  }
+
+  try {
+    const pageResponse = await fetch(`${ORIGIN_BASE}/`, {
+      method: "GET",
+      headers: {
+        ...headers,
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+      },
+    });
+    cookieHeader = mergeCookieHeaders(
+      cookieHeader,
+      mergeSetCookieHeader("", pageResponse.headers.get("set-cookie")),
+    );
+    debugLog(
+      "匿名 bootstrap: GET / -> %d cookies=%s",
+      pageResponse.status,
+      summarizeCookieHeader(cookieHeader),
+    );
+  } catch (error) {
+    debugLog("匿名 bootstrap: GET / 失败: %s", String(error));
+  }
+
+  const authResponse = await fetchWithCurlFallback(`${ORIGIN_BASE}/api/v1/auths/`, {
+    method: "GET",
+    headers: {
+      ...headers,
+      Accept: "*/*",
+      ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+    },
+  }, "匿名 bootstrap /api/v1/auths/");
+  if (!authResponse.ok) {
+    throw new Error(`anonymous auth bootstrap failed: ${authResponse.status}`);
+  }
+  cookieHeader = mergeCookieHeaders(
+    cookieHeader,
+    mergeSetCookieHeader("", authResponse.headers.get("set-cookie")),
+  );
+
+  const parsed = (await authResponse.json()) as {
+    token?: string;
+    id?: string;
+    email?: string;
+    name?: string;
+    role?: string;
+  };
+  if (!parsed?.token) {
+    if (importedAnonymousSession?.authToken) {
+      anonymousBootstrapState = importedAnonymousSession;
+      debugLog("匿名 bootstrap 未拿到新 token，回退导入 capture token");
+      return anonymousBootstrapState;
+    }
+    throw new Error("Anonymous token is empty");
+  }
+  if (!isGuestRole(parsed.role)) {
+    throw new Error(`Anonymous auth bootstrap returned non-guest role: ${parsed.role || "unknown"}`);
+  }
+
+  anonymousBootstrapState = buildUpstreamBootstrapSession(
+    "anonymous_guest",
+    parsed.token,
+    cookieHeader,
+    parsed,
+  );
+  debugLog(
+    "匿名 bootstrap 完成: token=%s cookies=%s profile=%s",
+    maskToken(parsed.token),
+    summarizeCookieHeader(anonymousBootstrapState.cookieHeader),
+    parsed.name || parsed.email || "",
+  );
+  return anonymousBootstrapState;
+}
+
+async function bootstrapLoggedInCookieSession(): Promise<UpstreamBootstrapSession> {
+  if (!UPSTREAM_LOGGED_IN_COOKIE_HEADER) {
+    throw new Error("UPSTREAM_LOGGED_IN_COOKIE_HEADER is empty");
+  }
+  if (loggedInCookieBootstrapState && (Date.now() - loggedInCookieBootstrapState.updatedAt) <= 25 * 60 * 1000) {
+    return loggedInCookieBootstrapState;
+  }
+
+  const headers = await SmartHeaderGenerator.generateHeaders("");
+  let cookieHeader = mergeCookieHeaders(
+    UPSTREAM_LOGGED_IN_COOKIE_HEADER,
+    UPSTREAM_EXTRA_COOKIE_HEADER,
+  );
+  const response = await fetchWithCurlFallback(`${ORIGIN_BASE}/api/v1/auths/`, {
+    method: "GET",
+    headers: {
+      ...headers,
+      Accept: "*/*",
+      ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+    },
+  }, "登录 bootstrap /api/v1/auths/");
+  if (!response.ok) {
+    throw new Error(`logged-in cookie auth bootstrap failed: ${response.status}`);
+  }
+  cookieHeader = mergeCookieHeaders(
+    cookieHeader,
+    mergeSetCookieHeader("", response.headers.get("set-cookie")),
+  );
+  const parsed = (await response.json()) as {
+    token?: string;
+    id?: string;
+    email?: string;
+    name?: string;
+    role?: string;
+  };
+  if (!parsed?.token) {
+    throw new Error("Logged-in cookie bootstrap returned empty token");
+  }
+  if (isGuestRole(parsed.role)) {
+    throw new Error("Logged-in cookie bootstrap returned guest role");
+  }
+  loggedInCookieBootstrapState = buildUpstreamBootstrapSession(
+    "logged_in_cookie",
+    parsed.token,
+    cookieHeader,
+    parsed,
+  );
+  debugLog(
+    "登录 cookie bootstrap 完成: token=%s profile=%s role=%s cookies=%s",
+    maskToken(parsed.token),
+    parsed.name || parsed.email || "",
+    parsed.role || "",
+    summarizeCookieHeader(loggedInCookieBootstrapState.cookieHeader),
+  );
+  return loggedInCookieBootstrapState;
+}
+
+async function getLoggedInCookieSession(): Promise<UpstreamBootstrapSession> {
+  return await bootstrapLoggedInCookieSession();
+}
+
+interface UpstreamChatBootstrapResult {
+  id?: string;
+  meta?: {
+    workspace_id?: string;
+  };
+  chat?: {
+    id?: string;
+    history?: {
+      messages?: Record<string, UpstreamChatHistoryNode>;
+      currentId?: string | null;
+    };
+  };
+  message_version?: number;
+  type?: string;
+}
+
+class UpstreamSessionBootstrap {
+  private sessions = new Map<string, UpstreamBootstrapSession>();
+  private pending = new Map<string, Promise<UpstreamBootstrapSession>>();
+  private readonly maxAgeMs = 25 * 60 * 1000;
+  private readonly warmupMaxAgeMs = 5 * 60 * 1000;
+
+  private mergeResponseCookies(token: string, response: Response): void {
+    const cached = this.sessions.get(token);
+    if (!cached) return;
+    cached.cookieHeader = mergeSetCookieHeader(
+      cached.cookieHeader,
+      response.headers.get("set-cookie"),
+    );
+    cached.updatedAt = Date.now();
+    if (cached.authToken && cached.authToken !== token) {
+      this.sessions.set(cached.authToken, cached);
+    }
+  }
+
+  private isFresh(session: UpstreamBootstrapSession | undefined): boolean {
+    return !!session && (Date.now() - session.updatedAt) <= this.maxAgeMs;
+  }
+
+  private isWarm(session: UpstreamBootstrapSession | undefined): boolean {
+    return !!session?.warmedUpAt && (Date.now() - session.warmedUpAt) <= this.warmupMaxAgeMs;
+  }
+
+  private async warmup(session: UpstreamBootstrapSession): Promise<void> {
+    if (this.isWarm(session)) {
+      return;
+    }
+    const headers = await SmartHeaderGenerator.generateHeaders("");
+    let mergedCookieHeader = mergeCookieHeaders(
+      session.cookieHeader,
+      UPSTREAM_EXTRA_COOKIE_HEADER,
+    );
+    const baseHeaders = {
+      ...headers,
+      Accept: "*/*",
+      Authorization: `Bearer ${session.authToken}`,
+    };
+    const steps: Array<{ method: "GET" | "POST"; endpoint: string; body?: string }> = [
+      { method: "GET", endpoint: `${ORIGIN_BASE}/api/config` },
+      { method: "GET", endpoint: `${ORIGIN_BASE}/api/models` },
+      {
+        method: "POST",
+        endpoint: `${ORIGIN_BASE}/api/v1/users/user/settings/update`,
+        body: JSON.stringify({ ui: { timezone: getPreferredBrowserTimezone() } }),
+      },
+      { method: "GET", endpoint: `${ORIGIN_BASE}/api/v1/scene-cfg/` },
+      { method: "GET", endpoint: `${ORIGIN_BASE}/api/v1/users/user/settings` },
+    ];
+    for (const step of steps) {
+      try {
+        const requestHeaders = {
+          ...baseHeaders,
+          ...(step.method === "POST" ? { "Content-Type": "application/json" } : {}),
+          ...(mergedCookieHeader ? { Cookie: mergedCookieHeader } : {}),
+        };
+        const response = await fetch(step.endpoint, {
+          method: step.method,
+          headers: requestHeaders,
+          ...(step.body ? { body: step.body } : {}),
+        });
+        this.mergeWarmupCookies(session, response.headers.get("set-cookie"));
+        mergedCookieHeader = mergeCookieHeaders(
+          session.cookieHeader,
+          UPSTREAM_EXTRA_COOKIE_HEADER,
+        );
+        debugLog(
+          "上游 warmup: %s %s -> %d cookies=%s",
+          step.method,
+          step.endpoint.replace(ORIGIN_BASE, ""),
+          response.status,
+          summarizeCookieHeader(mergedCookieHeader),
+        );
+      } catch (error) {
+        debugLog(
+          "上游 warmup 失败: %s %s -> %s",
+          step.method,
+          step.endpoint.replace(ORIGIN_BASE, ""),
+          String(error),
+        );
+      }
+    }
+    session.warmedUpAt = Date.now();
+  }
+
+  private mergeWarmupCookies(session: UpstreamBootstrapSession, setCookieHeader: string | null): void {
+    session.cookieHeader = mergeSetCookieHeader(session.cookieHeader, setCookieHeader);
+    session.updatedAt = Date.now();
+  }
+
+  invalidate(token: string): void {
+    const cached = this.sessions.get(token);
+    if (cached?.authToken && cached.authToken !== token) {
+      this.sessions.delete(cached.authToken);
+      this.pending.delete(cached.authToken);
+    }
+    this.sessions.delete(token);
+    this.pending.delete(token);
+  }
+
+  async ensureSession(token: string, refererChatID = ""): Promise<UpstreamBootstrapSession> {
+    const seeded = findBootstrapSessionByToken(token);
+    const cached = this.sessions.get(token) || seeded || undefined;
+    if (this.isFresh(cached)) {
+      if (cached) {
+        this.sessions.set(token, cached);
+        if (cached.authToken && cached.authToken !== token) {
+          this.sessions.set(cached.authToken, cached);
+        }
+        if (!this.isWarm(cached)) {
+          await this.warmup(cached);
+        }
+      }
+      return cached!;
+    }
+    const pending = this.pending.get(token);
+    if (pending) {
+      return await pending;
+    }
+    const job = this.bootstrap(token, refererChatID);
+    this.pending.set(token, job);
+    try {
+      const session = await job;
+      this.sessions.set(token, session);
+      if (session.authToken && session.authToken !== token) {
+        this.sessions.set(session.authToken, session);
+      }
+      return session;
+    } finally {
+      this.pending.delete(token);
+    }
+  }
+
+  private async bootstrap(token: string, refererChatID = ""): Promise<UpstreamBootstrapSession> {
+    const headers = await SmartHeaderGenerator.generateHeaders(refererChatID);
+    const seeded = findBootstrapSessionByToken(token);
+    const bootstrapCookieHeader = mergeCookieHeaders(
+      seeded?.cookieHeader,
+      UPSTREAM_EXTRA_COOKIE_HEADER,
+    );
+    const response = await fetchWithCurlFallback(`${ORIGIN_BASE}/api/v1/auths/`, {
+      method: "GET",
+      headers: {
+        ...headers,
+        Accept: "*/*",
+        Authorization: `Bearer ${token}`,
+        ...(bootstrapCookieHeader ? { Cookie: bootstrapCookieHeader } : {}),
+      },
+    }, "上游 session bootstrap /api/v1/auths/");
+    if (!response.ok) {
+      throw new Error(`upstream auth bootstrap failed: ${response.status}`);
+    }
+    let cookieHeader = mergeCookieHeaders(
+      bootstrapCookieHeader,
+      mergeSetCookieHeader("", response.headers.get("set-cookie")),
+    );
+    const bodyText = await response.text();
+    let returnedAuthToken = token;
+    let profileId = "";
+    let profileEmail = "";
+    let profileName = "";
+    let profileRole = "";
+    try {
+      const parsed = JSON.parse(bodyText) as {
+        token?: string;
+        id?: string;
+        email?: string;
+        name?: string;
+        role?: string;
+      };
+      if (typeof parsed?.token === "string" && parsed.token) {
+        returnedAuthToken = parsed.token;
+      }
+      if (typeof parsed?.id === "string" && parsed.id) {
+        profileId = parsed.id;
+      }
+      if (typeof parsed?.email === "string" && parsed.email) {
+        profileEmail = parsed.email;
+      }
+      if (typeof parsed?.name === "string" && parsed.name) {
+        profileName = parsed.name;
+      }
+      if (typeof parsed?.role === "string" && parsed.role) {
+        profileRole = parsed.role;
+      }
+    } catch {
+      // Ignore parse failure and keep using the original token.
+    }
+    const session = {
+      mode: seeded?.mode || "configured_token",
+      cookieHeader: mergeCookieHeaders(cookieHeader, `token=${returnedAuthToken}`),
+      // 真实前端后续请求继续使用 localStorage 原始 token，而不是 /auths 返回的新 token。
+      authToken: token,
+      returnedAuthToken,
+      profileId,
+      profileEmail,
+      profileName,
+      profileRole,
+      requestProfile: seeded?.requestProfile || buildImportedSessionProfiles().requestProfile,
+      fingerprintProfile: seeded?.fingerprintProfile || buildImportedSessionProfiles().fingerprintProfile,
+      updatedAt: Date.now(),
+    };
+    debugLog(
+      "上游 session bootstrap 完成: has_cookie=%s, token_refreshed=%s, profile_name=%s, cookie_preview=%s",
+      cookieHeader ? "true" : "false",
+      returnedAuthToken !== token ? "true" : "false",
+      profileName || "",
+      cookieHeader ? cookieHeader.slice(0, 80) : "",
+    );
+    await this.warmup(session);
+    return session;
+  }
+
+  async createChat(
+    token: string,
+    payload: UpstreamChatBootstrapPayload,
+    refererChatID = "",
+  ): Promise<UpstreamChatBootstrapResult> {
+    const session = await this.ensureSession(token, refererChatID);
+    const headers = await SmartHeaderGenerator.generateHeaders(refererChatID);
+    const mergedCookieHeader = mergeCookieHeaders(
+      session.cookieHeader,
+      UPSTREAM_EXTRA_COOKIE_HEADER,
+    );
+    const response = await fetchWithCurlFallback(`${ORIGIN_BASE}/api/v1/chats/new`, {
+      method: "POST",
+      headers: {
+        ...headers,
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${session.authToken}`,
+        ...(mergedCookieHeader ? { Cookie: mergedCookieHeader } : {}),
+      },
+      body: JSON.stringify({ chat: payload }),
+    }, "上游 chats/new");
+    const bodyText = await response.text();
+    if (!response.ok) {
+      throw new Error(`upstream chats/new failed: ${response.status} ${bodyText.slice(0, 400)}`);
+    }
+    this.mergeResponseCookies(token, response);
+    const parsed = JSON.parse(bodyText) as UpstreamChatBootstrapResult;
+    debugLog(
+      "上游 chats/new 完成: chat_id=%s message_version=%s",
+      parsed?.id || parsed?.chat?.id || "",
+      parsed?.message_version ?? "",
+    );
+    return parsed;
+  }
+}
+
+const upstreamSessionBootstrap = new UpstreamSessionBootstrap();
+
+async function getAnonymousToken(): Promise<string> {
+  try {
+    const session = await bootstrapAnonymousSession();
+    return session.authToken;
   } catch (error) {
     debugLog("获取匿名token失败: %v", error);
     throw error;
@@ -1624,6 +4003,449 @@ async function generateSignature(
   };
 }
 
+function parseHeaderBlock(raw: string): Headers {
+  const headers = new Headers();
+  const blocks = raw
+    .split(/\r?\n\r?\n/)
+    .map((block) => block.trim())
+    .filter(Boolean);
+  const lastBlock = blocks[blocks.length - 1] || "";
+  for (const line of lastBlock.split(/\r?\n/).slice(1)) {
+    const idx = line.indexOf(":");
+    if (idx === -1) continue;
+    const key = line.slice(0, idx).trim();
+    const value = line.slice(idx + 1).trim();
+    if (!key) continue;
+    headers.append(key, value);
+  }
+  return headers;
+}
+
+function extractLastHttpHeaderBlock(raw: string): string {
+  const blocks = raw
+    .split(/\r?\n\r?\n/)
+    .map((block) => block.trim())
+    .filter(Boolean);
+  for (let i = blocks.length - 1; i >= 0; i -= 1) {
+    if (blocks[i].startsWith("HTTP/")) {
+      return blocks[i];
+    }
+  }
+  return blocks[blocks.length - 1] || "";
+}
+
+async function runCurlCommand(args: string[], stdinText?: string): Promise<void> {
+  const proxyUrl = await resolveUpstreamProxyUrl();
+  const baseArgs = ["--compressed", ...args];
+  const finalArgs = proxyUrl ? ["--proxy", proxyUrl, ...baseArgs] : baseArgs;
+  const child = new Deno.Command("curl", {
+    args: finalArgs,
+    stdin: stdinText != null ? "piped" : "null",
+    stdout: "piped",
+    stderr: "piped",
+  }).spawn();
+  if (stdinText != null) {
+    const writer = child.stdin.getWriter();
+    await writer.write(new TextEncoder().encode(stdinText));
+    writer.releaseLock();
+    await child.stdin.close();
+  }
+  const [status, stderrBytes] = await Promise.all([child.status, child.stderr.getReader().read()]);
+  if (!status.success) {
+    const stderrText = stderrBytes.value ? new TextDecoder().decode(stderrBytes.value) : "";
+    throw new Error(`curl failed (${status.code}): ${stderrText}`);
+  }
+}
+
+async function readCommandStdout(command: string, args: string[]): Promise<string> {
+  const child = new Deno.Command(command, {
+    args,
+    stdout: "piped",
+    stderr: "null",
+  }).spawn();
+  const [status, stdoutChunk] = await Promise.all([
+    child.status,
+    child.stdout.getReader().read(),
+  ]);
+  if (!status.success) {
+    throw new Error(`${command} failed: ${status.code}`);
+  }
+  return stdoutChunk.value ? new TextDecoder().decode(stdoutChunk.value).trim() : "";
+}
+
+function parseHostResolveOverrides(spec: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const part of spec.split(/[\n,]/).map((item) => item.trim()).filter(Boolean)) {
+    const idx = part.indexOf("=");
+    if (idx === -1) continue;
+    const host = part.slice(0, idx).trim().toLowerCase();
+    const ip = part.slice(idx + 1).trim();
+    if (host && ip) {
+      out[host] = ip;
+    }
+  }
+  return out;
+}
+
+const HOST_RESOLVE_OVERRIDES = parseHostResolveOverrides(UPSTREAM_HOST_RESOLVE_OVERRIDES);
+
+function getCurlResolveArgsForUrl(targetUrl: string): string[] {
+  try {
+    const parsed = new URL(targetUrl);
+    const host = parsed.hostname.trim().toLowerCase();
+    const ip = HOST_RESOLVE_OVERRIDES[host];
+    if (!ip) return [];
+    const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+    return ["--resolve", `${parsed.hostname}:${port}:${ip}`];
+  } catch {
+    return [];
+  }
+}
+
+function hasCurlResolveOverride(targetUrl: string): boolean {
+  return getCurlResolveArgsForUrl(targetUrl).length > 0;
+}
+
+async function detectSystemProxyUrl(): Promise<string | null> {
+  if (!UPSTREAM_SYSTEM_PROXY_AUTO_DETECT) {
+    return null;
+  }
+
+  try {
+    const mode = await readCommandStdout("gsettings", [
+      "get",
+      "org.gnome.system.proxy",
+      "mode",
+    ]);
+    if (!mode.includes("manual")) {
+      return null;
+    }
+
+    const httpHost = (await readCommandStdout("gsettings", [
+      "get",
+      "org.gnome.system.proxy.http",
+      "host",
+    ])).replaceAll("'", "").trim();
+    const httpPort = (await readCommandStdout("gsettings", [
+      "get",
+      "org.gnome.system.proxy.http",
+      "port",
+    ])).trim();
+    if (httpHost && httpPort && httpPort !== "0") {
+      return `http://${httpHost}:${httpPort}`;
+    }
+
+    const socksHost = (await readCommandStdout("gsettings", [
+      "get",
+      "org.gnome.system.proxy.socks",
+      "host",
+    ])).replaceAll("'", "").trim();
+    const socksPort = (await readCommandStdout("gsettings", [
+      "get",
+      "org.gnome.system.proxy.socks",
+      "port",
+    ])).trim();
+    if (socksHost && socksPort && socksPort !== "0") {
+      return `socks5h://${socksHost}:${socksPort}`;
+    }
+  } catch (error) {
+    debugLog("系统代理探测失败: %v", error);
+  }
+
+  return null;
+}
+
+function detectEnvProxyUrl(): string | null {
+  const candidates = [
+    Deno.env.get("HTTPS_PROXY"),
+    Deno.env.get("https_proxy"),
+    Deno.env.get("ALL_PROXY"),
+    Deno.env.get("all_proxy"),
+    Deno.env.get("HTTP_PROXY"),
+    Deno.env.get("http_proxy"),
+  ];
+  for (const candidate of candidates) {
+    const value = String(candidate || "").trim();
+    if (value) {
+      return value;
+    }
+  }
+  return null;
+}
+
+async function resolveUpstreamProxyUrl(): Promise<string | null> {
+  if (cachedResolvedProxyUrlPromise) {
+    return cachedResolvedProxyUrlPromise;
+  }
+
+  cachedResolvedProxyUrlPromise = (async () => {
+    if (UPSTREAM_PROXY_URL.trim()) {
+      return UPSTREAM_PROXY_URL.trim();
+    }
+    const systemProxyUrl = await detectSystemProxyUrl();
+    if (systemProxyUrl) {
+      return systemProxyUrl;
+    }
+    const envProxyUrl = detectEnvProxyUrl();
+    if (envProxyUrl) {
+      return envProxyUrl;
+    }
+    return null;
+  })();
+
+  const proxyUrl = await cachedResolvedProxyUrlPromise;
+  if (proxyUrl) {
+    debugLog("上游代理已启用: %s", proxyUrl);
+  } else {
+    debugLog("上游代理未启用");
+  }
+  return proxyUrl;
+}
+
+function shouldFallbackToCurlForFetchError(error: unknown): boolean {
+  const text = String(error && (error as Error).stack || error).toLowerCase();
+  return (
+    text.includes("unsuccessful tunnel") ||
+    text.includes("proxy") ||
+    text.includes("client error (connect)") ||
+    text.includes("httpconnect") ||
+    text.includes("tunnel")
+  );
+}
+
+async function callSimpleCurlRequest(
+  fullURL: string,
+  init: RequestInit,
+): Promise<Response> {
+  const headerFile = await Deno.makeTempFile({ suffix: ".headers.txt" });
+  const bodyFile = await Deno.makeTempFile({ suffix: ".body.txt" });
+  try {
+    const method = String(init.method || "GET").toUpperCase();
+    const finalHeaders = headersToObject(init.headers || {});
+    const args = [
+      "-sS",
+      "-L",
+      "-D",
+      headerFile,
+      "-o",
+      bodyFile,
+      "-X",
+      method,
+      ...getCurlResolveArgsForUrl(fullURL),
+      fullURL,
+    ];
+    for (const [key, value] of Object.entries(finalHeaders)) {
+      args.push("-H", `${key}: ${value}`);
+    }
+
+    let stdinText: string | undefined = undefined;
+    if (init.body != null) {
+      if (typeof init.body === "string") {
+        stdinText = init.body;
+      } else if (init.body instanceof Uint8Array) {
+        stdinText = new TextDecoder().decode(init.body);
+      } else {
+        stdinText = String(init.body);
+      }
+      args.push("--data-binary", "@-");
+    }
+
+    await runCurlCommand(args, stdinText);
+
+    const headerRaw = await Deno.readTextFile(headerFile);
+    const bodyText = await Deno.readTextFile(bodyFile);
+    const lastHeaderBlock = extractLastHttpHeaderBlock(headerRaw);
+    const headers = parseHeaderBlock(lastHeaderBlock);
+    const statusLine = lastHeaderBlock.split(/\r?\n/)[0] || "HTTP/1.1 502";
+    const status = Number(statusLine.split(" ")[1] || "502");
+    return new Response(bodyText, {
+      status,
+      headers,
+    });
+  } finally {
+    await Promise.all([
+      Deno.remove(headerFile).catch(() => undefined),
+      Deno.remove(bodyFile).catch(() => undefined),
+    ]);
+  }
+}
+
+async function fetchWithCurlFallback(
+  fullURL: string,
+  init: RequestInit,
+  logLabel: string,
+): Promise<Response> {
+  const proxyUrl = await resolveUpstreamProxyUrl();
+  if (proxyUrl) {
+    debugLog("%s 检测到代理，直接使用 curl 请求: %s", logLabel, proxyUrl);
+    return await callSimpleCurlRequest(fullURL, init);
+  }
+  try {
+    return await fetch(fullURL, init);
+  } catch (error) {
+    if (!shouldFallbackToCurlForFetchError(error)) {
+      throw error;
+    }
+    debugLog("%s fetch 失败，尝试 curl 回退: %s", logLabel, String(error));
+    return await callSimpleCurlRequest(fullURL, init);
+  }
+}
+
+async function callUpstreamWithCurl(
+  fullURL: string,
+  finalHeaders: Record<string, string>,
+  authToken: string,
+  reqBody: string,
+): Promise<Response> {
+  const cookieJar = await Deno.makeTempFile({ suffix: ".cookies.txt" });
+  const headerFile = await Deno.makeTempFile({ suffix: ".headers.txt" });
+  const bodyFile = await Deno.makeTempFile({ suffix: ".body.txt" });
+  try {
+    const authArgs = [
+      "-sS",
+      "-L",
+      "-c",
+      cookieJar,
+      ...getCurlResolveArgsForUrl(`${ORIGIN_BASE}/api/v1/auths/`),
+      `${ORIGIN_BASE}/api/v1/auths/`,
+      "-H",
+      `User-Agent: ${getPreferredBrowserUserAgent()}`,
+      "-H",
+      "Accept: */*",
+      "-H",
+      `Accept-Language: ${getPreferredBrowserAcceptLanguage()}`,
+      "-H",
+      `X-FE-Version: ${X_FE_VERSION}`,
+      "-H",
+      `sec-ch-ua: ${getPreferredSecChUa()}`,
+      "-H",
+      `sec-ch-ua-mobile: ${getPreferredSecChUaMobile()}`,
+      "-H",
+      `sec-ch-ua-platform: ${getPreferredSecChUaPlatform()}`,
+      "-H",
+      `Origin: ${ORIGIN_BASE}`,
+      "-H",
+      `Referer: ${ORIGIN_BASE}/`,
+      "-H",
+      `Authorization: Bearer ${authToken}`,
+      "-o",
+      "/dev/null",
+    ];
+    await runCurlCommand(authArgs).catch((error) => {
+      debugLog("curl auth bootstrap 失败: %s", String(error));
+    });
+
+    const chatArgs = [
+      "-sS",
+      "-D",
+      headerFile,
+      "-o",
+      bodyFile,
+      "-b",
+      cookieJar,
+      "-X",
+      "POST",
+      ...getCurlResolveArgsForUrl(fullURL),
+      fullURL,
+    ];
+    for (const [key, value] of Object.entries(finalHeaders)) {
+      chatArgs.push("-H", `${key}: ${value}`);
+    }
+    chatArgs.push("--data-binary", "@-");
+    await runCurlCommand(chatArgs, reqBody);
+
+    const headerRaw = await Deno.readTextFile(headerFile);
+    const bodyText = await Deno.readTextFile(bodyFile);
+    const lastHeaderBlock = extractLastHttpHeaderBlock(headerRaw);
+    const headers = parseHeaderBlock(lastHeaderBlock);
+    const statusLine = lastHeaderBlock
+      .split(/\r?\n/)[0] || "HTTP/1.1 502";
+    const status = Number(statusLine.split(" ")[1] || "502");
+    return new Response(bodyText, {
+      status,
+      headers,
+    });
+  } finally {
+    await Promise.all([
+      Deno.remove(cookieJar).catch(() => undefined),
+      Deno.remove(headerFile).catch(() => undefined),
+      Deno.remove(bodyFile).catch(() => undefined),
+    ]);
+  }
+}
+
+async function callUpstreamWithImpersonatedClient(
+  fullURL: string,
+  finalHeaders: Record<string, string>,
+  authToken: string,
+  reqBody: string,
+): Promise<Response> {
+  const proxyUrl = await resolveUpstreamProxyUrl();
+  const authHeaders: Record<string, string> = {
+    "User-Agent": getPreferredBrowserUserAgent(),
+    "Accept": "*/*",
+    "Accept-Language": getPreferredBrowserAcceptLanguage(),
+    "X-FE-Version": X_FE_VERSION,
+    "sec-ch-ua": getPreferredSecChUa(),
+    "sec-ch-ua-mobile": getPreferredSecChUaMobile(),
+    "sec-ch-ua-platform": getPreferredSecChUaPlatform(),
+    "Origin": ORIGIN_BASE,
+    "Referer": `${ORIGIN_BASE}/`,
+    "Authorization": `Bearer ${authToken}`,
+  };
+  const scriptPayload = {
+    proxy_url: proxyUrl,
+    auth_url: `${ORIGIN_BASE}/api/v1/auths/`,
+    target_url: fullURL,
+    auth_headers: authHeaders,
+    final_headers: finalHeaders,
+    body: reqBody,
+    impersonate: UPSTREAM_IMPERSONATE_BROWSER,
+  };
+
+  const child = new Deno.Command("python", {
+    args: ["tools/upstream_impersonated_request.py"],
+    stdin: "piped",
+    stdout: "piped",
+    stderr: "piped",
+  }).spawn();
+
+  const writer = child.stdin.getWriter();
+  await writer.write(new TextEncoder().encode(JSON.stringify(scriptPayload)));
+  writer.releaseLock();
+  await child.stdin.close();
+
+  const [status, stdoutChunk, stderrChunk] = await Promise.all([
+    child.status,
+    child.stdout.getReader().read(),
+    child.stderr.getReader().read(),
+  ]);
+
+  const stdoutText = stdoutChunk.value ? new TextDecoder().decode(stdoutChunk.value) : "";
+  const stderrText = stderrChunk.value ? new TextDecoder().decode(stderrChunk.value) : "";
+  if (!status.success) {
+    throw new Error(`impersonated client failed (${status.code}): ${stderrText || stdoutText}`);
+  }
+
+  let parsed: {
+    status?: number;
+    reason?: string;
+    headers?: Record<string, string>;
+    body?: string;
+  };
+  try {
+    parsed = JSON.parse(stdoutText);
+  } catch (error) {
+    throw new Error(`impersonated client parse failed: ${String(error)} stdout=${stdoutText.slice(0, 500)}`);
+  }
+
+  return new Response(parsed.body || "", {
+    status: parsed.status || 502,
+    statusText: parsed.reason || "",
+    headers: new Headers(parsed.headers || {}),
+  });
+}
+
 async function callUpstreamWithHeaders(
   upstreamReq: UpstreamRequest,
   refererChatID: string,
@@ -1682,6 +4504,17 @@ async function callUpstreamWithHeaders(
 
     // 4. 生成智能浏览器头部
     const smartHeaders = await SmartHeaderGenerator.generateHeaders(refererChatID);
+    let sessionCookieHeader = "";
+    try {
+      const session = await upstreamSessionBootstrap.ensureSession(authToken, refererChatID);
+      sessionCookieHeader = session.cookieHeader || "";
+    } catch (sessionError) {
+      debugLog("上游 session bootstrap 失败: %v", sessionError);
+    }
+    const mergedSessionCookieHeader = mergeCookieHeaders(
+      sessionCookieHeader,
+      UPSTREAM_EXTRA_COOKIE_HEADER,
+    );
 
     // 5. 生成完整的浏览器指纹参数
     const fingerprintParams = BrowserFingerprintGenerator.generateFingerprintParams(
@@ -1699,22 +4532,91 @@ async function callUpstreamWithHeaders(
 
     const params = new URLSearchParams(allParams);
     const fullURL = `${UPSTREAM_URL}?${params.toString()}`;
+    const queryToken = params.get("token") || "";
 
     // 7. 合并头部
-    const finalHeaders = {
-      ...smartHeaders,
+    const finalHeaders: Record<string, string> = {
       "Authorization": `Bearer ${authToken}`,
+      "Accept": "*/*",
+      "Content-Type": "application/json",
+      "Accept-Language": smartHeaders["Accept-Language"] || getPreferredBrowserAcceptLanguage(),
+      "Origin": ORIGIN_BASE,
+      "Referer": "",
+      "Sec-Fetch-Dest": "empty",
+      "Sec-Fetch-Mode": "cors",
+      "Sec-Fetch-Site": "same-origin",
+      "Sec-Ch-Ua": getPreferredSecChUa(),
+      "Sec-Ch-Ua-Mobile": getPreferredSecChUaMobile(),
+      "Sec-Ch-Ua-Platform": getPreferredSecChUaPlatform(),
+      "User-Agent": getPreferredBrowserUserAgent(),
+      "X-FE-Version": X_FE_VERSION,
+      "X-Region": BROWSER_REGION,
       "X-Signature": signature,
-      "Accept": "application/json, text/event-stream",
+      ...(mergedSessionCookieHeader ? { "Cookie": mergedSessionCookieHeader } : {}),
     };
 
-    const response = await fetch(fullURL, {
-      method: "POST",
-      headers: finalHeaders,
-      body: reqBody,
-    });
+    debugLog(
+      "上游请求关键头: referer=%s origin=%s x-fe-version=%s x-region=%s sec-fetch-site=%s ua=%s",
+      finalHeaders["Referer"] || "",
+      finalHeaders["Origin"] || "",
+      finalHeaders["X-FE-Version"] || "",
+      finalHeaders["X-Region"] || "",
+      finalHeaders["Sec-Fetch-Site"] || "",
+      finalHeaders["User-Agent"] || "",
+    );
+    debugLog(
+      "上游会话态: auth=%s query_token=%s cookie_keys=%s",
+      maskToken(authToken),
+      maskToken(queryToken),
+      summarizeCookieHeader(mergedSessionCookieHeader),
+    );
+    debugLog("上游请求 URL: %s", fullURL);
 
-    debugLog("上游响应状态: %d %s", response.status, response.statusText);
+    const transportPreference = ["auto", "fetch", "curl", "impersonate"].includes(UPSTREAM_TRANSPORT_PREFERENCE)
+      ? UPSTREAM_TRANSPORT_PREFERENCE
+      : "auto";
+    let response: Response;
+    if (transportPreference === "curl") {
+      debugLog("上游传输模式: curl");
+      response = await callUpstreamWithCurl(fullURL, finalHeaders, authToken, reqBody);
+      debugLog("curl transport 上游响应状态: %d %s", response.status, response.statusText);
+    } else if (transportPreference === "impersonate") {
+      debugLog("上游传输模式: impersonate");
+      response = await callUpstreamWithImpersonatedClient(fullURL, finalHeaders, authToken, reqBody);
+      debugLog("impersonated transport 上游响应状态: %d %s", response.status, response.statusText);
+    } else {
+      if (hasCurlResolveOverride(fullURL)) {
+        debugLog("上游传输模式: auto(检测到 --resolve 覆盖，优先 curl)");
+        response = await callUpstreamWithCurl(fullURL, finalHeaders, authToken, reqBody);
+        debugLog("curl transport 上游响应状态: %d %s", response.status, response.statusText);
+      } else {
+      if (transportPreference !== "fetch") {
+        debugLog("上游传输模式: auto(fetch 优先)");
+      } else {
+        debugLog("上游传输模式: fetch");
+      }
+      response = await fetch(fullURL, {
+        method: "POST",
+        headers: finalHeaders,
+        body: reqBody,
+      });
+
+      debugLog("上游响应状态: %d %s", response.status, response.statusText);
+      if (transportPreference === "auto" && (response.status === 404 || response.status === 405)) {
+        debugLog("检测到 Deno fetch 上游异常状态，切换 impersonated transport 重试: %d", response.status);
+        response = await callUpstreamWithImpersonatedClient(fullURL, finalHeaders, authToken, reqBody);
+        debugLog("impersonated transport 上游响应状态: %d %s", response.status, response.statusText);
+        if (response.status === 404 || response.status === 405) {
+          debugLog("impersonated transport 仍异常，切换 curl transport 重试: %d", response.status);
+          response = await callUpstreamWithCurl(fullURL, finalHeaders, authToken, reqBody);
+          debugLog("curl transport 上游响应状态: %d %s", response.status, response.statusText);
+        }
+      }
+      }
+    }
+    if (response.status === 401 || response.status === 403 || response.status === 405) {
+      upstreamSessionBootstrap.invalidate(authToken);
+    }
 
     // 8. 成功时标记 Token 为有效
     tokenPool.markSuccess(authToken);
@@ -1722,6 +4624,64 @@ async function callUpstreamWithHeaders(
     return response;
   } catch (error) {
     debugLog("调用上游失败: %v", error);
+    try {
+      debugLog("尝试直接使用 impersonated transport 兜底");
+      const timestamp = Date.now();
+      const requestId = crypto.randomUUID();
+      const lastMessageContent = ImageProcessor.extractLastUserContent(upstreamReq.messages);
+      if (!lastMessageContent) {
+        throw error;
+      }
+      let userId = "unknown";
+      try {
+        const tokenParts = authToken.split(".");
+        if (tokenParts.length === 3) {
+          const payload = JSON.parse(
+            new TextDecoder().decode(decodeBase64(tokenParts[1]))
+          );
+          for (const key of ["id", "user_id", "uid", "sub"]) {
+            const val = payload[key];
+            if (typeof val === "string" || typeof val === "number") {
+              const strVal = String(val);
+              if (strVal.length > 0) {
+                userId = strVal;
+                break;
+              }
+            }
+          }
+        }
+      } catch (_innerErr) {
+        // ignore
+      }
+      const e = `requestId,${requestId},timestamp,${timestamp},user_id,${userId}`;
+      const { signature } = await generateSignature(e, lastMessageContent, timestamp);
+      const smartHeaders = await SmartHeaderGenerator.generateHeaders(refererChatID);
+      const fingerprintParams = BrowserFingerprintGenerator.generateFingerprintParams(
+        timestamp,
+        requestId,
+        authToken,
+        refererChatID
+      );
+      const fullURL = `${UPSTREAM_URL}?${new URLSearchParams({
+        ...fingerprintParams,
+        signature_timestamp: timestamp.toString(),
+      }).toString()}`;
+      const finalHeaders = {
+        ...smartHeaders,
+        "Authorization": `Bearer ${authToken}`,
+        "X-Signature": signature,
+        "Accept": "application/json, text/event-stream",
+      };
+      const reqBody = JSON.stringify(upstreamReq);
+      try {
+        return await callUpstreamWithImpersonatedClient(fullURL, finalHeaders, authToken, reqBody);
+      } catch (impersonatedError) {
+        debugLog("impersonated transport 兜底失败: %v", impersonatedError);
+      }
+      return await callUpstreamWithCurl(fullURL, finalHeaders, authToken, reqBody);
+    } catch (curlError) {
+      debugLog("curl transport 兜底失败: %v", curlError);
+    }
 
     // 失败时尝试切换 Token
     try {
@@ -1809,6 +4769,13 @@ async function processUpstreamStream(
                 errObj?.code,
                 errObj?.detail
               );
+              if (isUpstreamCaptchaError(errObj)) {
+                invalidateCaptchaVerifyParam(
+                  `upstream-stream-error:${
+                    errObj?.verify_code || errObj?.captcha_error_type || errObj?.error_code || errObj?.code || "unknown"
+                  }`,
+                );
+              }
 
               // 分析错误类型，特别是多模态相关错误
               const errorDetail = (errObj?.detail || "").toLowerCase();
@@ -1826,23 +4793,18 @@ async function processUpstreamStream(
                 debugLog("      4. 检查图片是否损坏");
               }
 
-              // 发送结束chunk
-              const endChunk: OpenAIResponse = {
-                id: `chatcmpl-${Date.now()}`,
-                object: "chat.completion.chunk",
-                created: Math.floor(Date.now() / 1000),
-                model: modelName,
-                choices: [
-                  {
-                    index: 0,
-                    delta: {},
-                    finish_reason: "stop",
-                  },
-                ],
+              const upstreamMessage = errObj?.detail || "Upstream stream error";
+              const errorChunk = {
+                error: {
+                  message: upstreamMessage,
+                  type: "upstream_stream_error",
+                  code: errObj?.error_code || errObj?.code || "UPSTREAM_STREAM_ERROR",
+                  captcha_error_type: errObj?.captcha_error_type,
+                  verify_code: errObj?.verify_code,
+                },
               };
-
               await writer.write(
-                encoder.encode(`data: ${JSON.stringify(endChunk)}\n\n`)
+                encoder.encode(`data: ${JSON.stringify(errorChunk)}\n\n`)
               );
               await writer.write(encoder.encode("data: [DONE]\n\n"));
               return;
@@ -1926,6 +4888,16 @@ async function processUpstreamStream(
   }
 }
 
+function getUpstreamErrorFromChunk(upstreamData: UpstreamData): UpstreamError | null {
+  return (
+    upstreamData.error ||
+    upstreamData.data.data?.error ||
+    upstreamData.data.error ||
+    (upstreamData.data.inner && upstreamData.data.inner.error) ||
+    null
+  );
+}
+
 // 收集完整响应（用于非流式响应）
 async function collectFullResponse(
   body: ReadableStream<Uint8Array>
@@ -1951,6 +4923,10 @@ async function collectFullResponse(
 
           try {
             const upstreamData = JSON.parse(dataStr) as UpstreamData;
+            const errObj = getUpstreamErrorFromChunk(upstreamData);
+            if (errObj) {
+              throw new Error(`UPSTREAM_SSE_ERROR:${JSON.stringify(errObj)}`);
+            }
 
             if (upstreamData.data.delta_content !== "") {
               let out = upstreamData.data.delta_content;
@@ -1978,6 +4954,30 @@ async function collectFullResponse(
     reader.releaseLock();
   }
 
+  return fullContent;
+}
+
+function collectFullResponseFromText(rawText: string): string {
+  let fullContent = "";
+  for (const line of rawText.split(/\r?\n/)) {
+    if (!line.startsWith("data: ")) continue;
+    const dataStr = line.substring(6).trim();
+    if (!dataStr || dataStr === "[DONE]") continue;
+    const upstreamData = JSON.parse(dataStr) as UpstreamData;
+    const errObj = getUpstreamErrorFromChunk(upstreamData);
+    if (errObj) {
+      throw new Error(`UPSTREAM_SSE_ERROR:${JSON.stringify(errObj)}`);
+    }
+    const delta = upstreamData.data.delta_content;
+    if (delta) {
+      fullContent += upstreamData.data.phase === "thinking"
+        ? transformThinking(delta)
+        : delta;
+    }
+    if (upstreamData.data.done || upstreamData.data.phase === "done") {
+      return fullContent;
+    }
+  }
   return fullContent;
 }
 
@@ -2820,6 +5820,152 @@ async function handleOptions(request: Request): Promise<Response> {
   return new Response("Not Found", { status: 404, headers });
 }
 
+async function handleInternalSessionState(request: Request): Promise<Response> {
+  const headers = new Headers();
+  setCORSHeaders(headers);
+  headers.set("Content-Type", "application/json; charset=utf-8");
+
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 200, headers });
+  }
+
+  const authHeader = request.headers.get("Authorization");
+  if (!validateApiKey(authHeader)) {
+    return new Response(JSON.stringify({ ok: false, error: "unauthorized" }), {
+      status: 401,
+      headers,
+    });
+  }
+
+  if (request.method === "GET") {
+    return new Response(JSON.stringify({
+      ok: true,
+      state: getCaptchaSessionSnapshot(),
+    }), { status: 200, headers });
+  }
+
+  if (request.method !== "POST") {
+    return new Response(JSON.stringify({ ok: false, error: "method_not_allowed" }), {
+      status: 405,
+      headers,
+    });
+  }
+
+  const body = await request.json().catch(() => ({}));
+  const captchaVerifyParam = typeof body?.captcha_verify_param === "string"
+    ? body.captcha_verify_param.trim()
+    : null;
+  const token = typeof body?.token === "string" ? body.token.trim() : null;
+  const source = typeof body?.source === "string" ? body.source.trim() : "manual";
+
+  if (captchaVerifyParam) {
+    updateCaptchaSessionState({
+      captchaVerifyParam,
+      token,
+      source,
+    });
+  } else if (token) {
+    updateCaptchaSessionState({
+      token,
+      source,
+    });
+  }
+
+  return new Response(JSON.stringify({
+    ok: true,
+    state: getCaptchaSessionSnapshot(),
+  }), { status: 200, headers });
+}
+
+async function handleInternalPureCodeWorker(request: Request): Promise<Response> {
+  const headers = new Headers();
+  setCORSHeaders(headers);
+  headers.set("Content-Type", "application/json; charset=utf-8");
+
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 200, headers });
+  }
+
+  const authHeader = request.headers.get("Authorization");
+  if (!validateApiKey(authHeader)) {
+    return new Response(JSON.stringify({ ok: false, error: "unauthorized" }), {
+      status: 401,
+      headers,
+    });
+  }
+
+  try {
+    if (request.method === "GET") {
+      const status = await pureCodeWorkerBridge.status().catch(() => null);
+      return new Response(JSON.stringify({
+        ok: true,
+        enabled: AUTO_CAPTCHA_PURE_CODE_ENABLED,
+        bridge: pureCodeWorkerBridge.snapshot(),
+        worker: status,
+        session: getCaptchaSessionSnapshot(),
+      }), { status: 200, headers });
+    }
+
+    if (request.method !== "POST") {
+      return new Response(JSON.stringify({ ok: false, error: "method_not_allowed" }), {
+        status: 405,
+        headers,
+      });
+    }
+
+    const body = await request.json().catch(() => ({}));
+    const action = typeof body?.action === "string" ? body.action : "status";
+
+    if (action === "warm") {
+      const result = await pureCodeWorkerBridge.warm();
+      return new Response(JSON.stringify({ ok: true, action, result }), {
+        status: 200,
+        headers,
+      });
+    }
+
+    if (action === "probe") {
+      const result = await pureCodeWorkerBridge.probe(!!body?.include_raw);
+      return new Response(JSON.stringify({ ok: true, action, result }), {
+        status: 200,
+        headers,
+      });
+    }
+
+    if (action === "captcha") {
+      const token = typeof body?.token === "string" ? body.token : "";
+      const payload = await pureCodeWorkerBridge.fetchCaptchaPayload(token);
+      if (typeof payload?.captcha_verify_param === "string") {
+        updateCaptchaSessionState({
+          captchaVerifyParam: payload.captcha_verify_param,
+          token,
+          source: "internal-pure-code-worker",
+          workerLastPayloadSource: typeof payload?.source === "string" ? payload.source : null,
+          workerLastError: null,
+        });
+      }
+      return new Response(JSON.stringify({
+        ok: true,
+        action,
+        payload,
+        session: getCaptchaSessionSnapshot(),
+      }), { status: 200, headers });
+    }
+
+    const result = await pureCodeWorkerBridge.status();
+    return new Response(JSON.stringify({ ok: true, action: "status", result }), {
+      status: 200,
+      headers,
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({
+      ok: false,
+      error: String(error && (error as Error).stack || error),
+      bridge: pureCodeWorkerBridge.snapshot(),
+    }), { status: 500, headers });
+  }
+}
+
 async function handleModels(request: Request): Promise<Response> {
   const headers = new Headers();
   setCORSHeaders(headers);
@@ -3073,16 +6219,126 @@ async function handleChatCompletions(request: Request): Promise<Response> {
     debugLog("ℹ️ 使用GLM-4.5V模型但未检测到图像数据，仅处理文本内容");
   }
 
-  // 生成会话相关ID
-  const chatID = `${Date.now()}-${Math.floor(Date.now() / 1000)}`;
-  const msgID = Date.now().toString();
-
-  // 获取模型对应的 MCP 服务器列表
-  const mcpServers = ModelCapabilityDetector.getMCPServersForModel(capabilities);
-  const hiddenMcpFeatures = ModelCapabilityDetector.getHiddenMCPFeatures();
-
-  // 提取用户最后消息内容（用于签名）
+  // 提取用户最后消息内容（用于签名和补齐消息树）
   const lastUserContent = ImageProcessor.extractLastUserContent(req.messages);
+
+  // 按前端消息树关系构造 chat context：
+  // 1. 先把已有消息串成 history；
+  // 2. 再为当前回复创建 assistant placeholder；
+  // 3. /chat/completions 的 id 指向 assistant placeholder，
+  //    current_user_message_* 指向它的父 user 节点及 user 的父节点。
+  const existingChatSession = getUpstreamChatSession(authToken);
+  const historyNodes: Record<string, UpstreamChatHistoryNode> = {};
+  let previousHistoryNodeId: string | null = existingChatSession?.lastAssistantMessageId || null;
+  let currentUserMessageID: string | null = null;
+  let currentUserMessageParentID: string | null = null;
+  for (const message of finalMessages) {
+    const nodeId = crypto.randomUUID();
+    historyNodes[nodeId] = {
+      id: nodeId,
+      parentId: previousHistoryNodeId,
+      childrenIds: [],
+      role: message.role,
+      content: message.content,
+      timestamp: Math.floor(Date.now() / 1000),
+      ...(message.role === "user" ? { models: [modelConfig.upstreamId] } : {}),
+    };
+    if (previousHistoryNodeId && historyNodes[previousHistoryNodeId]) {
+      historyNodes[previousHistoryNodeId].childrenIds.push(nodeId);
+    }
+    if (message.role === "user") {
+      currentUserMessageID = nodeId;
+      currentUserMessageParentID = previousHistoryNodeId;
+    }
+    previousHistoryNodeId = nodeId;
+  }
+  if (!currentUserMessageID) {
+    currentUserMessageID = crypto.randomUUID();
+    historyNodes[currentUserMessageID] = {
+      id: currentUserMessageID,
+      parentId: previousHistoryNodeId,
+      childrenIds: [],
+      role: "user",
+      content: lastUserContent,
+      timestamp: Math.floor(Date.now() / 1000),
+      models: [modelConfig.upstreamId],
+    };
+    if (previousHistoryNodeId && historyNodes[previousHistoryNodeId]) {
+      historyNodes[previousHistoryNodeId].childrenIds.push(currentUserMessageID);
+    }
+    currentUserMessageParentID = previousHistoryNodeId;
+    previousHistoryNodeId = currentUserMessageID;
+  }
+
+  const assistantPlaceholderID = crypto.randomUUID();
+  if (currentUserMessageID && historyNodes[currentUserMessageID]) {
+    currentUserMessageParentID = historyNodes[currentUserMessageID].parentId;
+  }
+
+  const bootstrapHistoryMessages: Record<string, UpstreamChatHistoryNode> = {};
+  if (currentUserMessageID && historyNodes[currentUserMessageID]) {
+    bootstrapHistoryMessages[currentUserMessageID] = {
+      ...historyNodes[currentUserMessageID],
+      childrenIds: [],
+    };
+  }
+
+  const bootstrapPayload: UpstreamChatBootstrapPayload = {
+    id: "",
+    title: "New Chat",
+    models: [modelConfig.upstreamId],
+    params: {},
+    history: {
+      messages: bootstrapHistoryMessages,
+      currentId: currentUserMessageID,
+    },
+    tags: [],
+    flags: [],
+    features: MCP_FEATURES,
+    enable_thinking: true,
+    auto_web_search: false,
+    message_version: 1,
+    extra: {},
+    timestamp: Date.now(),
+    type: "default",
+  };
+  const upstreamSession = await upstreamSessionBootstrap.ensureSession(authToken, "");
+  const upstreamAuthToken = upstreamSession.authToken || authToken;
+  const browserUserName = getBrowserUserName(upstreamAuthToken, {
+    name: upstreamSession.profileName,
+    email: upstreamSession.profileEmail,
+  });
+  let chatID: string = existingChatSession?.chatId || crypto.randomUUID();
+  if (!existingChatSession) {
+    try {
+      const bootstrapChat = await upstreamSessionBootstrap.createChat(
+        authToken,
+        bootstrapPayload,
+        "",
+      );
+      chatID = bootstrapChat.id || bootstrapChat.chat?.id || chatID;
+      updateUpstreamChatSession(authToken, {
+        chatId: chatID,
+        lastUserMessageId: currentUserMessageID,
+        lastAssistantMessageId: assistantPlaceholderID,
+      });
+    } catch (bootstrapError) {
+      debugLog("上游 chats/new bootstrap 失败，回退本地 chat_id: %v", bootstrapError);
+      updateUpstreamChatSession(authToken, {
+        chatId: chatID,
+        lastUserMessageId: currentUserMessageID,
+        lastAssistantMessageId: assistantPlaceholderID,
+      });
+    }
+  } else {
+    updateUpstreamChatSession(authToken, {
+      chatId: chatID,
+      lastUserMessageId: currentUserMessageID,
+      lastAssistantMessageId: assistantPlaceholderID,
+    });
+  }
+  const now = new Date();
+  const currentDateTime = formatBrowserDateTime(now);
 
   // 记录工具信息
   if (req.tools && req.tools.length > 0) {
@@ -3094,85 +6350,44 @@ async function handleChatCompletions(request: Request): Promise<Response> {
     debugLog("🔧 未检测到工具定义");
   }
 
-  // 构造上游请求（增强版）
+  const requestFeatures: Record<string, unknown> = {
+    image_generation: false,
+    web_search: false,
+    auto_web_search: false,
+    preview_mode: true,
+    flags: [],
+    vlm_tools_enable: false,
+    vlm_web_search_enable: false,
+    vlm_website_mode: false,
+    enable_thinking: true,
+  };
+
+  // 构造上游请求，尽量贴近浏览器成功样本
   const upstreamReq: UpstreamRequest = {
-    stream: true, // 总是使用流式从上游获取
+    // 与客户端请求保持一致，避免把非流式请求误发成流式。
+    stream: req.stream === true,
     chat_id: chatID,
-    id: msgID,
+    id: assistantPlaceholderID,
+    current_user_message_id: currentUserMessageID,
+    current_user_message_parent_id: currentUserMessageParentID,
     model: modelConfig.upstreamId,
     messages: finalMessages,
-    params: modelConfig.defaultParams,
-    features: {
-      image_generation: false,
-      web_search: capabilities.search || capabilities.advancedSearch,
-      auto_web_search: capabilities.search || capabilities.advancedSearch,
-      preview_mode: capabilities.search || capabilities.advancedSearch,
-      flags: [],
-      features: hiddenMcpFeatures,
-      enable_thinking: capabilities.thinking,
-    },
+    params: {},
+    extra: {},
+    features: requestFeatures,
     background_tasks: {
-      title_generation: false,
-      tags_generation: false,
+      title_generation: true,
+      tags_generation: true,
     },
-    mcp_servers: mcpServers.concat(req.tools ? req.tools.map(t => t.function.name) : []),
-    model_item: {
-      id: modelConfig.upstreamId,
-      name: req.model, // 使用原始请求的模型名
-      owned_by: "openai",
-      openai: {
-        id: modelConfig.upstreamId,
-        name: modelConfig.upstreamId,
-        owned_by: "openai",
-        openai: {
-          id: modelConfig.upstreamId,
-        },
-        urlIdx: 1,
-      },
-      urlIdx: 1,
-      info: {
-        id: modelConfig.upstreamId,
-        user_id: "api-user",
-        base_model_id: null,
-        name: modelConfig.name,
-        params: modelConfig.defaultParams,
-        meta: {
-          profile_image_url: "/static/favicon.png",
-          description: capabilities.vision
-            ? "Advanced visual understanding and analysis"
-            : capabilities.thinking
-            ? "Advanced reasoning and thinking model"
-            : capabilities.search
-            ? "Web search enhanced model"
-            : "Most advanced model, proficient in coding and tool use",
-          capabilities: {
-            vision: capabilities.vision,
-            citations: false,
-            preview_mode: capabilities.search || capabilities.advancedSearch,
-            web_search: capabilities.search || capabilities.advancedSearch,
-            language_detection: false,
-            restore_n_source: false,
-            mcp: capabilities.mcp,
-            file_qa: capabilities.mcp,
-            returnFc: true,
-            returnThink: capabilities.thinking,
-            think: capabilities.thinking,
-          },
-        },
-      },
-    },
-    tool_servers: req.tools ? req.tools.map(tool => tool.function.name) : [],
     variables: {
-      "{{USER_NAME}}": `Guest-${Date.now()}`,
+      "{{USER_NAME}}": browserUserName,
       "{{USER_LOCATION}}": "Unknown",
-      "{{CURRENT_DATETIME}}": new Date().toLocaleString("zh-CN"),
-      "{{CURRENT_DATE}}": new Date().toLocaleDateString("zh-CN"),
-      "{{CURRENT_TIME}}": new Date().toLocaleTimeString("zh-CN"),
-      "{{CURRENT_WEEKDAY}}": new Date().toLocaleDateString("zh-CN", {
-        weekday: "long",
-      }),
-      "{{CURRENT_TIMEZONE}}": "Asia/Shanghai",
-      "{{USER_LANGUAGE}}": "zh-CN",
+      "{{CURRENT_DATETIME}}": currentDateTime,
+      "{{CURRENT_DATE}}": currentDateTime.slice(0, 10),
+      "{{CURRENT_TIME}}": currentDateTime.slice(11),
+      "{{CURRENT_WEEKDAY}}": formatBrowserWeekday(now),
+      "{{CURRENT_TIMEZONE}}": getPreferredBrowserTimezone(),
+      "{{USER_LANGUAGE}}": getPreferredBrowserLanguage(),
     },
     // 添加文件列表（如果有上传的图像）
     ...(uploadedFiles.length > 0 && !capabilities.vision ? { files: uploadedFiles } : {}),
@@ -3180,13 +6395,23 @@ async function handleChatCompletions(request: Request): Promise<Response> {
     signature_prompt: lastUserContent,
   };
 
+  if (req.tools && req.tools.length > 0) {
+    upstreamReq.tool_servers = req.tools.map((tool) => tool.function.name);
+  }
+
+  await tryAttachCaptchaVerifyParam(
+    upstreamReq,
+    upstreamAuthToken,
+    modelConfig.id,
+  );
+
   // 调用上游API
   try {
     if (req.stream) {
       return await handleStreamResponse(
         upstreamReq,
         chatID,
-        authToken,
+        upstreamAuthToken,
         startTime,
         path,
         userAgent,
@@ -3197,7 +6422,7 @@ async function handleChatCompletions(request: Request): Promise<Response> {
       return await handleNonStreamResponse(
         upstreamReq,
         chatID,
-        authToken,
+        upstreamAuthToken,
         startTime,
         path,
         userAgent,
@@ -3238,10 +6463,22 @@ async function handleStreamResponse(
 
     if (!response.ok) {
       debugLog("上游返回错误状态: %d", response.status);
+      const upstreamErrorText = await response.text();
+      const upstreamContentType = response.headers.get("content-type") || "text/plain; charset=utf-8";
+      debugLog("上游流式错误响应体预览: %s", upstreamErrorText.slice(0, 2000));
       const duration = Date.now() - startTime;
       recordRequestStats(startTime, path, 502);
       addLiveRequest("POST", path, 502, duration, userAgent);
-      return new Response("Upstream error", { status: 502 });
+      return new Response(upstreamErrorText || "Upstream error", {
+        status: 502,
+        headers: {
+          "Content-Type": upstreamContentType,
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization",
+          "Access-Control-Allow-Credentials": "true",
+        },
+      });
     }
 
     if (!response.body) {
@@ -3328,10 +6565,21 @@ async function handleNonStreamResponse(
 
     if (!response.ok) {
       debugLog("上游返回错误状态: %d", response.status);
+      const upstreamErrorText = await response.text();
+      debugLog("上游错误响应体预览: %s", upstreamErrorText.slice(0, 2000));
       const duration = Date.now() - startTime;
       recordRequestStats(startTime, path, 502);
       addLiveRequest("POST", path, 502, duration, userAgent);
-      return new Response("Upstream error", { status: 502 });
+      return new Response(upstreamErrorText || "Upstream error", {
+        status: 502,
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization",
+          "Access-Control-Allow-Credentials": "true",
+        },
+      });
     }
 
     if (!response.body) {
@@ -3343,7 +6591,9 @@ async function handleNonStreamResponse(
     }
 
     // 收集完整响应
-    const finalContent = await collectFullResponse(response.body);
+    const rawUpstreamText = await response.text();
+    const finalContent = collectFullResponseFromText(rawUpstreamText);
+    debugLog("上游非流式原始响应预览: %s", rawUpstreamText.slice(0, 2000));
     debugLog("内容收集完成，最终长度: %d", finalContent.length);
 
     // 构造完整响应
@@ -3385,6 +6635,64 @@ async function handleNonStreamResponse(
       },
     });
   } catch (error) {
+    const message = String(error && (error as Error).message || error);
+    if (message.startsWith("UPSTREAM_SSE_ERROR:")) {
+      const detail = message.slice("UPSTREAM_SSE_ERROR:".length);
+      try {
+        const errObj = JSON.parse(detail) as UpstreamError;
+        if (isUpstreamCaptchaError(errObj)) {
+          const retryAttempted = upstreamReq.extra?.__captcha_retry_attempted === true;
+          if (!retryAttempted) {
+            debugLog(
+              "非流式响应命中 CAPTCHA 错误，尝试获取 captcha_verify_param 后重试一次: code=%s verify_code=%s captcha_error_type=%s",
+              String(errObj.error_code || errObj.code || ""),
+              String(errObj.verify_code || ""),
+              String(errObj.captcha_error_type || ""),
+            );
+            if (!upstreamReq.extra) {
+              upstreamReq.extra = {};
+            }
+            upstreamReq.extra.__captcha_retry_attempted = true;
+            await tryAttachCaptchaVerifyParam(
+              upstreamReq,
+              authToken,
+              modelConfig.id,
+            );
+            if (upstreamReq.captcha_verify_param) {
+              debugLog("已在 CAPTCHA 错误后补注入 captcha_verify_param，开始重试非流式请求");
+              return await handleNonStreamResponse(
+                upstreamReq,
+                chatID,
+                authToken,
+                startTime,
+                path,
+                userAgent,
+                req,
+                modelConfig,
+              );
+            }
+            debugLog("CAPTCHA 错误后重试前仍未拿到 captcha_verify_param");
+          }
+          invalidateCaptchaVerifyParam(
+            `upstream-nonstream-error:${
+              errObj.verify_code || errObj.captcha_error_type || errObj.error_code || errObj.code || "unknown"
+            }`,
+          );
+        }
+      } catch {
+        // ignore parse failure
+      }
+      return new Response(detail, {
+        status: 502,
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization",
+          "Access-Control-Allow-Credentials": "true",
+        },
+      });
+    }
     debugLog("处理非流式响应时出错: %v", error);
     const duration = Date.now() - startTime;
     recordRequestStats(startTime, path, 502);
@@ -5343,6 +8651,28 @@ async function handleHttp(conn: Deno.Conn) {
         const response = await handleChatCompletions(request);
         await respondWith(response);
         // 请求统计已在handleChatCompletions中记录
+      } else if (url.pathname === "/internal/session-state") {
+        const response = await handleInternalSessionState(request);
+        await respondWith(response);
+        recordRequestStats(startTime, url.pathname, response.status);
+        addLiveRequest(
+          request.method,
+          url.pathname,
+          response.status,
+          Date.now() - startTime,
+          userAgent
+        );
+      } else if (url.pathname === "/internal/pure-code-worker") {
+        const response = await handleInternalPureCodeWorker(request);
+        await respondWith(response);
+        recordRequestStats(startTime, url.pathname, response.status);
+        addLiveRequest(
+          request.method,
+          url.pathname,
+          response.status,
+          Date.now() - startTime,
+          userAgent
+        );
       } else if (url.pathname === "/docs") {
         const response = await handleDocs(request);
         await respondWith(response);
@@ -5459,6 +8789,28 @@ async function handleRequest(request: Request): Promise<Response> {
     } else if (url.pathname === "/v1/chat/completions") {
       const response = await handleChatCompletions(request);
       // 请求统计已在handleChatCompletions中记录
+      return response;
+    } else if (url.pathname === "/internal/session-state") {
+      const response = await handleInternalSessionState(request);
+      recordRequestStats(startTime, url.pathname, response.status);
+      addLiveRequest(
+        request.method,
+        url.pathname,
+        response.status,
+        Date.now() - startTime,
+        userAgent
+      );
+      return response;
+    } else if (url.pathname === "/internal/pure-code-worker") {
+      const response = await handleInternalPureCodeWorker(request);
+      recordRequestStats(startTime, url.pathname, response.status);
+      addLiveRequest(
+        request.method,
+        url.pathname,
+        response.status,
+        Date.now() - startTime,
+        userAgent
+      );
       return response;
     } else if (url.pathname === "/docs") {
       const response = await handleDocs(request);
