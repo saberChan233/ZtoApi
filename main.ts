@@ -1694,43 +1694,69 @@ function stringifyToolSchema(tool: Tool): string {
   }
 }
 
-function buildZaiToolCallBridgeInstruction(req: OpenAIRequest): string {
+export function buildZaiToolCallBridgeInstruction(req: OpenAIRequest): string {
   const tools = (req.tools || []).map(stringifyToolSchema).join("\n");
   const forcedTool = typeof req.tool_choice === "object"
     ? req.tool_choice.function.name
     : "";
   const choiceRule = forcedTool
-    ? `You MUST call the tool named ${forcedTool}.`
-    : "You decide whether to call tools. If the task requires files, commands, MCP resources, project state, or any external/local data, call the most appropriate tool. After tool results arrive, decide the next tool or final answer yourself.";
+    ? `You MUST call the tool named ${forcedTool} right now by emitting its tool-call payload.`
+    : "You decide whether to call tools. If the task needs files, commands, MCP resources, project state, or any external/local data you do not already have, you MUST call the most appropriate tool instead of answering from memory. After tool results arrive, decide the next tool or the final answer yourself.";
 
   return [
     "You are the planning brain behind an OpenAI-compatible tool-call bridge for an agentic coding client.",
+    "Every reply you produce MUST be exactly one of these two things and nothing else:",
+    "  (1) a single tool-call payload (when you need to act / gather information), or",
+    "  (2) your final answer (only when no further tool call is needed).",
+    'CRITICAL: Never announce or describe an action without performing it. Replies such as "I will first look at the directory structure", "Let me check ...", "First, I\'ll ...", "我先看下目录结构" are FORBIDDEN: if you intend to use a tool, your entire reply must be the tool-call payload itself, with no sentence before or after it.',
     choiceRule,
     "Plan dynamically from the conversation and tool results; do not follow a fixed canned sequence.",
     "You may call tools across multiple turns. When enough evidence is available, provide the final answer instead of calling another tool.",
     "Never claim that you inspected files, directories, commands, MCP resources, or the current project unless a tool result was provided in this conversation.",
-    "When a tool is needed, output ONLY one tool-call payload and no markdown/prose/explanation.",
+    "When a tool is needed, output ONLY one tool-call payload: no markdown, no prose, no explanation, no thinking text in the answer.",
     "Preferred DSML/XML shape:",
     '<tool_calls><invoke name="tool_name"><parameter name="arg">value</parameter></invoke></tool_calls>',
     "Alternative JSON shape:",
     '{"tool_calls":[{"name":"tool_name","arguments":{}}]}',
-    "Do not stream partial natural-language text before a tool call. If unsure, call a safe inspection/search tool first.",
+    "If you are unsure what to do next, call a safe inspection/search tool rather than narrating.",
     "Available tools:",
     tools,
   ].join("\n");
 }
 
-function injectZaiToolCallBridgeInstruction(
+// Short, high-salience reminder appended as the LAST message before generation.
+// Agentic clients (Kilo / pi / Claude Code) prepend a very large system prompt,
+// which drowns out a single leading bridge instruction; repeating the core rule
+// in the most-recent position is what reliably makes the model emit a tool-call
+// payload instead of narrating its plan and stopping.
+export function buildZaiToolCallBridgeReminder(req: OpenAIRequest): string {
+  const forcedTool = typeof req.tool_choice === "object"
+    ? req.tool_choice.function.name
+    : "";
+  const lines = [
+    "[tool-call bridge] Reminder before you answer:",
+    "- Reply with EITHER exactly one tool-call payload OR your final answer — never both, never neither.",
+    "- Do NOT describe what you are about to do. If you intend to use a tool, emit the tool-call payload as your entire reply now.",
+    '- Payload shape: <tool_calls><invoke name="tool_name"><parameter name="arg">value</parameter></invoke></tool_calls> (or {"tool_calls":[{"name":"tool_name","arguments":{}}]}).',
+  ];
+  if (forcedTool) {
+    lines.push(`- You must call the tool named ${forcedTool} now.`);
+  }
+  return lines.join("\n");
+}
+
+export function injectZaiToolCallBridgeInstruction(
   messages: Message[],
   req: OpenAIRequest,
 ): Message[] {
   if (!shouldUseZaiToolCallBridge(req)) {
     return messages;
   }
-  return [{
-    role: "system",
-    content: buildZaiToolCallBridgeInstruction(req),
-  }, ...messages];
+  return [
+    { role: "system", content: buildZaiToolCallBridgeInstruction(req) },
+    ...messages,
+    { role: "system", content: buildZaiToolCallBridgeReminder(req) },
+  ];
 }
 
 function tryParseToolCallJson(rawContent: string): Record<string, any> | null {

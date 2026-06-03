@@ -16,6 +16,9 @@ import { assert, assertEquals } from "jsr:@std/assert@1";
 import {
   buildFallbackArgumentsForTool,
   buildZaiFallbackToolCalls,
+  buildZaiToolCallBridgeInstruction,
+  buildZaiToolCallBridgeReminder,
+  injectZaiToolCallBridgeInstruction,
   looksLikeToolMarkerPrefix,
   type Message,
   type OpenAIRequest,
@@ -217,4 +220,77 @@ Deno.test("serializeToolCallsForZai: renders name and arguments", () => {
     function: { name: "read_file", arguments: '{"path":"a.ts"}' },
   }]);
   assertEquals(text, '- read_file({"path":"a.ts"})');
+});
+
+// --- Kilo fix: bridge instruction placement + strength --------------------
+//
+// Agentic clients (Kilo, pi, Claude Code) prepend a very large system prompt.
+// A single leading bridge instruction gets drowned out and the model narrates
+// ("I will first look at the directory structure") and stops without emitting a
+// tool-call payload. The instruction must forbid that and be repeated as the
+// most-recent message so the model reliably emits a tool call.
+
+Deno.test("injectZaiToolCallBridgeInstruction: wraps history with leading + trailing system messages", () => {
+  const history: Message[] = [
+    { role: "system", content: "KILO_HUGE_SYSTEM_PROMPT" },
+    { role: "user", content: "分析项目，找出项目缺陷" },
+  ];
+  const out = injectZaiToolCallBridgeInstruction(
+    history,
+    req({ messages: history, tool_choice: "auto" }),
+  );
+  // Leading instruction is first, original history preserved in order, and a
+  // high-salience reminder is the LAST message before generation.
+  assertEquals(out.length, history.length + 2);
+  assertEquals(out[0].role, "system");
+  assert(
+    String(out[0].content).includes("tool-call bridge"),
+  );
+  assertEquals(out[1].content, "KILO_HUGE_SYSTEM_PROMPT");
+  assertEquals(out[2].content, "分析项目，找出项目缺陷");
+  const last = out[out.length - 1];
+  assertEquals(last.role, "system");
+  assert(String(last.content).includes("[tool-call bridge] Reminder"));
+});
+
+Deno.test("injectZaiToolCallBridgeInstruction: no-op without tools / tool_choice=none", () => {
+  const history: Message[] = [{ role: "user", content: "hi" }];
+  assertEquals(
+    injectZaiToolCallBridgeInstruction(
+      history,
+      req({ messages: history, tools: [] }),
+    ),
+    history,
+  );
+  assertEquals(
+    injectZaiToolCallBridgeInstruction(
+      history,
+      req({ messages: history, tool_choice: "none" }),
+    ),
+    history,
+  );
+});
+
+Deno.test("bridge instruction forbids announcing actions without calling a tool", () => {
+  const text = buildZaiToolCallBridgeInstruction(req({ tool_choice: "auto" }));
+  // The exact failure mode reported from Kilo must be explicitly forbidden.
+  assert(text.includes("FORBIDDEN"));
+  assert(text.toLowerCase().includes("never announce"));
+  assert(text.includes("我先看下目录结构"));
+  // Both payload shapes are documented and every tool name is listed.
+  assert(text.includes("<tool_calls>"));
+  assert(text.includes('{"tool_calls"'));
+  assert(text.includes("read_file"));
+  assert(text.includes("bash"));
+});
+
+Deno.test("bridge reminder names the forced tool when tool_choice is an object", () => {
+  const forced = buildZaiToolCallBridgeReminder(
+    req({ tool_choice: { type: "function", function: { name: "bash" } } }),
+  );
+  assert(forced.includes("must call the tool named bash"));
+  // Auto mode omits the forced-tool line but still demands a payload-or-answer.
+  const auto = buildZaiToolCallBridgeReminder(req({ tool_choice: "auto" }));
+  assert(!auto.includes("must call the tool named"));
+  assert(auto.includes("EITHER exactly one tool-call payload"));
 });
