@@ -136,7 +136,7 @@ interface LiveRequest {
 /**
  * OpenAI工具定义
  */
-interface Tool {
+export interface Tool {
   type: "function";
   function: {
     name: string;
@@ -153,7 +153,7 @@ type ToolChoice = "none" | "auto" | "required" | {
   function: { name: string };
 };
 
-interface ToolCall {
+export interface ToolCall {
   id: string;
   type: "function";
   function: {
@@ -172,7 +172,7 @@ interface ToolCallDelta {
   };
 }
 
-interface OpenAIRequest {
+export interface OpenAIRequest {
   model: string;
   messages: Message[];
   stream?: boolean;
@@ -226,7 +226,7 @@ interface AnthropicMessagesRequest {
  * 聊天消息结构
  * 支持全方位多模态内容：文本、图像、视频、文档
  */
-interface Message {
+export interface Message {
   role: string;
   name?: string;
   reasoning_content?: string;
@@ -1619,7 +1619,7 @@ function messageContentToZaiText(content: Message["content"]): string {
   }).filter(Boolean).join("\n");
 }
 
-function serializeToolCallsForZai(toolCalls?: ToolCall[]): string {
+export function serializeToolCallsForZai(toolCalls?: ToolCall[]): string {
   if (!toolCalls?.length) {
     return "";
   }
@@ -1639,7 +1639,7 @@ function normalizeRoleForZai(role: string): string {
   return "user";
 }
 
-function sanitizeMessageForZai(message: Message): Message {
+export function sanitizeMessageForZai(message: Message): Message {
   const role = normalizeRoleForZai(message.role);
 
   if (message.role === "tool") {
@@ -1935,62 +1935,17 @@ function fillFallbackArgumentBySchema(schema: Record<string, any>): unknown {
   return "";
 }
 
-function buildFallbackArgumentsForTool(
+// Build best-effort arguments for a forced tool call purely from the tool's
+// JSON schema. Never inject project-specific paths, commands or search
+// patterns: fabricating such arguments hijacks the calling agent's plan.
+export function buildFallbackArgumentsForTool(
   tool: Tool,
-  purpose = "initial-inspection",
 ): Record<string, unknown> {
   const params = tool.function.parameters || {};
   const properties = params.properties && typeof params.properties === "object"
     ? params.properties as Record<string, any>
     : {};
   const args: Record<string, unknown> = {};
-  const toolName = tool.function.name.toLowerCase();
-  const defectSearchPattern =
-    "TODO|FIXME|throw new Error|catch \\(|eval\\(|Deno\\.env\\.get|captcha|tool_calls|INTERNAL_ERROR|any";
-
-  if (/^read|read.*file|open.*file/i.test(toolName)) {
-    if ("path" in properties) {
-      args.path = purpose === "read-docs" ? "README.md" : "main.ts";
-    }
-    if ("file" in properties) {
-      args.file = purpose === "read-docs" ? "README.md" : "main.ts";
-    }
-    if ("file_path" in properties) {
-      args.file_path = purpose === "read-docs" ? "README.md" : "main.ts";
-    }
-  } else if ("path" in properties) args.path = ".";
-  if ("cwd" in properties) args.cwd = ".";
-  if ("recursive" in properties) args.recursive = true;
-  if ("pattern" in properties) {
-    args.pattern = /(grep|search|rg)/i.test(toolName)
-      ? defectSearchPattern
-      : "**/*";
-  }
-  if ("regex" in properties) args.regex = defectSearchPattern;
-  if ("query" in properties) {
-    args.query = purpose === "grep-defects"
-      ? "find defects, TODO, unsafe error handling, tool calling, captcha and context bugs"
-      : "project structure and defects";
-  }
-  if ("command" in properties) {
-    args.command = purpose === "grep-defects"
-      ? "rg -n \"TODO|FIXME|throw new Error|catch \\\\(|eval\\\\(|Deno\\\\.env\\\\.get|captcha|tool_calls|INTERNAL_ERROR|any\" -g '!node_modules' -g '!dist' -g '!coverage' . | sed -n '1,240p'"
-      : "pwd && ls -la && rg --files -g '!node_modules' -g '!dist' -g '!coverage' | sed -n '1,200p'";
-  }
-  if ("cmd" in properties) {
-    args.cmd = purpose === "grep-defects"
-      ? "rg -n \"TODO|FIXME|throw new Error|catch \\\\(|eval\\\\(|Deno\\\\.env\\\\.get|captcha|tool_calls|INTERNAL_ERROR|any\" -g '!node_modules' -g '!dist' -g '!coverage' . | sed -n '1,240p'"
-      : "pwd && ls -la && rg --files -g '!node_modules' -g '!dist' -g '!coverage' | sed -n '1,200p'";
-  }
-  if (
-    !Object.keys(args).length &&
-    /^(bash|shell|terminal|command)$/i.test(toolName)
-  ) {
-    args.command = purpose === "grep-defects"
-      ? "rg -n \"TODO|FIXME|throw new Error|catch \\\\(|eval\\\\(|Deno\\\\.env\\\\.get|captcha|tool_calls|INTERNAL_ERROR|any\" -g '!node_modules' -g '!dist' -g '!coverage' . | sed -n '1,240p'"
-      : "pwd && ls -la && rg --files -g '!node_modules' -g '!dist' -g '!coverage' | sed -n '1,200p'";
-  }
-
   const required = Array.isArray(params.required) ? params.required : [];
   for (const key of required) {
     if (typeof key !== "string" || args[key] !== undefined) continue;
@@ -2042,7 +1997,7 @@ function isProjectInspectionRequest(text: string): boolean {
       .test(text);
 }
 
-function shouldFallbackToZaiToolCall(req: OpenAIRequest): boolean {
+export function shouldFallbackToZaiToolCall(req: OpenAIRequest): boolean {
   if (!req.tools?.length || req.tool_choice === "none") {
     return false;
   }
@@ -2069,61 +2024,28 @@ function shouldFallbackToZaiToolCall(req: OpenAIRequest): boolean {
   return localInspectionRequest;
 }
 
-function buildZaiFallbackToolCalls(req: OpenAIRequest): ToolCall[] {
+export function buildZaiFallbackToolCalls(req: OpenAIRequest): ToolCall[] {
   if (!shouldFallbackToZaiToolCall(req)) {
     return [];
   }
   const tools = req.tools || [];
+  if (!tools.length) {
+    return [];
+  }
   const forcedToolName = typeof req.tool_choice === "object"
     ? req.tool_choice.function.name
     : "";
-  const localInspectionRequest = isProjectInspectionRequest(
-    getLastUserText(req.messages),
-  );
   const calledToolNames = getAssistantToolCallNames(req.messages);
-  const findTool = (patterns: RegExp[]) =>
-    tools.find((tool) =>
-      !calledToolNames.has(tool.function.name) &&
-      patterns.some((pattern) => pattern.test(tool.function.name))
-    );
-  let purpose = "initial-inspection";
+  // Fabrication is only reached when the client explicitly forced tool use
+  // (tool_choice as an object or "required"), or when the opt-in auto-fallback
+  // is enabled. Pick the forced tool, else the first not-yet-called tool, and
+  // fill arguments from the schema only -- never guess project commands.
   const preferred =
     (forcedToolName
       ? tools.find((tool) => tool.function.name === forcedToolName)
       : undefined) ||
-    (localInspectionRequest && hasOpenAIToolResult(req.messages)
-      ? (() => {
-        const grepTool = findTool([/(grep|rg|search)/i]);
-        if (grepTool) {
-          purpose = "grep-defects";
-          return grepTool;
-        }
-        const readTool = findTool([/^read/i, /read.*file/i]);
-        if (readTool) {
-          purpose = "read-main";
-          return readTool;
-        }
-        const globTool = findTool([/glob/i, /list.*(file|dir)/i]);
-        if (globTool) {
-          purpose = "initial-inspection";
-          return globTool;
-        }
-        return undefined;
-      })()
-      : undefined) ||
-    (localInspectionRequest
-      ? tools.find((tool) =>
-        /^(bash|shell|terminal|command)$/i.test(tool.function.name)
-      )
-      : undefined) ||
-    tools.find((tool) =>
-      /^(list_files|list_directory|list_dir)$/i.test(tool.function.name)
-    ) ||
-    tools.find((tool) => /list.*(file|dir)/i.test(tool.function.name)) ||
-    tools.find((tool) =>
-      /(search|glob|grep|rg).*file/i.test(tool.function.name)
-    ) ||
-    tools.find((tool) => /read.*file/i.test(tool.function.name));
+    tools.find((tool) => !calledToolNames.has(tool.function.name)) ||
+    tools[0];
   if (!preferred) {
     return [];
   }
@@ -2132,9 +2054,7 @@ function buildZaiFallbackToolCalls(req: OpenAIRequest): ToolCall[] {
     type: "function",
     function: {
       name: preferred.function.name,
-      arguments: JSON.stringify(
-        buildFallbackArgumentsForTool(preferred, purpose),
-      ),
+      arguments: JSON.stringify(buildFallbackArgumentsForTool(preferred)),
     },
   }];
 }
@@ -2158,89 +2078,6 @@ function buildZaiBridgeToolCallResponseMessage(
   }
 
   return null;
-}
-
-function buildZaiDirectToolCallMessage(req: OpenAIRequest): Message | null {
-  const toolCalls = buildZaiFallbackToolCalls(req);
-  if (!toolCalls.length) {
-    return null;
-  }
-  return { role: "assistant", content: null, tool_calls: toolCalls };
-}
-
-function createZaiDirectToolCallResponse(
-  req: OpenAIRequest,
-  message: Message,
-  baseHeaders: Headers,
-): Response {
-  const headers = new Headers(baseHeaders);
-  if (req.stream === true) {
-    headers.set("Content-Type", "text/event-stream");
-    headers.set("Cache-Control", "no-cache");
-    headers.set("Connection", "keep-alive");
-    const encoder = new TextEncoder();
-    const stream = new ReadableStream<Uint8Array>({
-      start(controller) {
-        const send = (payload: OpenAIResponse) => {
-          controller.enqueue(
-            encoder.encode(`data: ${JSON.stringify(payload)}\n\n`),
-          );
-        };
-        const created = Math.floor(Date.now() / 1000);
-        const id = `chatcmpl-${Date.now()}`;
-        send({
-          id,
-          object: "chat.completion.chunk",
-          created,
-          model: req.model,
-          choices: [{ index: 0, delta: { role: "assistant" } }],
-        });
-        send({
-          id,
-          object: "chat.completion.chunk",
-          created,
-          model: req.model,
-          choices: [{
-            index: 0,
-            delta: {
-              tool_calls: (message.tool_calls || []).map((toolCall, index) => ({
-                index,
-                id: toolCall.id,
-                type: "function" as const,
-                function: {
-                  name: toolCall.function.name,
-                  arguments: toolCall.function.arguments,
-                },
-              })),
-            },
-          }],
-        });
-        send({
-          id,
-          object: "chat.completion.chunk",
-          created,
-          model: req.model,
-          choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
-        });
-        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-        controller.close();
-      },
-    });
-    return new Response(stream, { status: 200, headers });
-  }
-
-  headers.set("Content-Type", "application/json");
-  return new Response(
-    JSON.stringify({
-      id: `chatcmpl-${Date.now()}`,
-      object: "chat.completion",
-      created: Math.floor(Date.now() / 1000),
-      model: req.model,
-      choices: [{ index: 0, message, finish_reason: "tool_calls" }],
-      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-    }),
-    { status: 200, headers },
-  );
 }
 
 function createToolCallChatCompletion(
@@ -2509,8 +2346,11 @@ const UPSTREAM_COMPACT_REUSE_LOCAL_HISTORY =
 const ZAI_FORWARD_OPENAI_TOOLS =
   Deno.env.get("ZAI_FORWARD_OPENAI_TOOLS") === "true";
 const ZAI_TOOL_CALL_BRIDGE = Deno.env.get("ZAI_TOOL_CALL_BRIDGE") !== "false";
+// Opt-in only. When false (default) the bridge never fabricates tool calls
+// from heuristics: it only surfaces tool calls the model actually emitted, so
+// agentic clients (pi, Claude Code, Codex, ...) keep full control over planning.
 const ZAI_TOOL_CALL_BRIDGE_AUTO_FALLBACK =
-  Deno.env.get("ZAI_TOOL_CALL_BRIDGE_AUTO_FALLBACK") !== "false";
+  Deno.env.get("ZAI_TOOL_CALL_BRIDGE_AUTO_FALLBACK") === "true";
 const UPSTREAM_EXPLICIT_CONVERSATION_HEADER = "x-ztoapi-conversation-id";
 const UPSTREAM_SESSION_KEY_SECRET =
   (Deno.env.get("UPSTREAM_SESSION_KEY_SECRET") || "ztoapi-session-v2").trim();
@@ -2909,18 +2749,30 @@ function loadUpstreamChatSessions(): void {
   }
 }
 
+function snapshotUpstreamChatSessions(): Record<
+  string,
+  UpstreamChatSessionState
+> {
+  const data: Record<string, UpstreamChatSessionState> = {};
+  const now = Date.now();
+  for (const [key, val] of upstreamChatSessions.entries()) {
+    if (now - val.updatedAt < 24 * 60 * 60 * 1000) {
+      data[key] = val;
+    }
+  }
+  return data;
+}
+
+// Synchronous write. Reserved for startup migration and the best-effort flush
+// on process exit; the request hot path uses scheduleSaveUpstreamChatSessions.
 function saveUpstreamChatSessions(): void {
   const tempFile =
     `${CHAT_SESSIONS_FILE}.${Date.now()}-${crypto.randomUUID()}.tmp`;
   try {
-    const data: Record<string, UpstreamChatSessionState> = {};
-    const now = Date.now();
-    for (const [key, val] of upstreamChatSessions.entries()) {
-      if (now - val.updatedAt < 24 * 60 * 60 * 1000) {
-        data[key] = val;
-      }
-    }
-    Deno.writeTextFileSync(tempFile, JSON.stringify(data, null, 2));
+    Deno.writeTextFileSync(
+      tempFile,
+      JSON.stringify(snapshotUpstreamChatSessions(), null, 2),
+    );
     Deno.renameSync(tempFile, CHAT_SESSIONS_FILE);
   } catch (error) {
     try {
@@ -2932,6 +2784,67 @@ function saveUpstreamChatSessions(): void {
   }
 }
 
+const CHAT_SESSIONS_SAVE_DEBOUNCE_MS = Math.max(
+  0,
+  Number(Deno.env.get("CHAT_SESSIONS_SAVE_DEBOUNCE_MS") || "750"),
+);
+let chatSessionsSaveTimer: ReturnType<typeof setTimeout> | null = null;
+let chatSessionsSaveQueued = false;
+let chatSessionsSaveChain: Promise<void> = Promise.resolve();
+
+async function writeUpstreamChatSessionsToDisk(
+  data: Record<string, UpstreamChatSessionState>,
+): Promise<void> {
+  const tempFile =
+    `${CHAT_SESSIONS_FILE}.${Date.now()}-${crypto.randomUUID()}.tmp`;
+  try {
+    await Deno.writeTextFile(tempFile, JSON.stringify(data, null, 2));
+    Deno.renameSync(tempFile, CHAT_SESSIONS_FILE);
+  } catch (error) {
+    try {
+      Deno.removeSync(tempFile);
+    } catch {
+      // ignore cleanup failure
+    }
+    throw error;
+  }
+}
+
+// Debounced + serialized async persistence. The in-memory Map is the source of
+// truth and is mutated synchronously; disk writes are coalesced and chained so
+// high-frequency agent turns never block the event loop with synchronous
+// full-file rewrites nor race on overlapping temp-file renames.
+function scheduleSaveUpstreamChatSessions(): void {
+  chatSessionsSaveQueued = true;
+  if (chatSessionsSaveTimer !== null) return;
+  chatSessionsSaveTimer = setTimeout(() => {
+    chatSessionsSaveTimer = null;
+    if (!chatSessionsSaveQueued) return;
+    chatSessionsSaveQueued = false;
+    const data = snapshotUpstreamChatSessions();
+    chatSessionsSaveChain = chatSessionsSaveChain
+      .then(() => writeUpstreamChatSessionsToDisk(data))
+      .catch((error) => {
+        debugLog("持久化 Chat 会话失败(async): %v", error);
+      });
+  }, CHAT_SESSIONS_SAVE_DEBOUNCE_MS);
+}
+
+// Best-effort flush of any pending debounced write when the process exits so a
+// restart does not lose the most recent chat_id mappings.
+if (typeof addEventListener === "function") {
+  addEventListener("unload", () => {
+    if (chatSessionsSaveQueued || chatSessionsSaveTimer !== null) {
+      chatSessionsSaveQueued = false;
+      if (chatSessionsSaveTimer !== null) {
+        clearTimeout(chatSessionsSaveTimer);
+        chatSessionsSaveTimer = null;
+      }
+      saveUpstreamChatSessions();
+    }
+  });
+}
+
 function getUpstreamChatSession(
   sessionKey: string,
 ): UpstreamChatSessionState | null {
@@ -2941,7 +2854,7 @@ function getUpstreamChatSession(
   }
   if (Date.now() - session.updatedAt > 24 * 60 * 60 * 1000) {
     upstreamChatSessions.delete(sessionKey);
-    saveUpstreamChatSessions();
+    scheduleSaveUpstreamChatSessions();
     return null;
   }
   return session;
@@ -3210,7 +3123,7 @@ function updateUpstreamChatSession(
     updatedAt: Date.now(),
   };
   upstreamChatSessions.set(sessionKey, next);
-  saveUpstreamChatSessions();
+  scheduleSaveUpstreamChatSessions();
   return next;
 }
 
@@ -7517,6 +7430,54 @@ function shouldHoldToolBridgeTextForSieve(content: string): boolean {
     .test(trimmed);
 }
 
+const TOOL_MARKER_COMPACT_PREFIXES = [
+  "<tool_calls",
+  "</tool_calls",
+  "<invoke",
+  "</invoke",
+  "<parameter",
+  "</parameter",
+  '{"tool_calls"',
+];
+
+// Whether `rawTail` could be the (possibly incomplete) beginning of a tool-call
+// marker. Tolerant to DSML/full-width drift via normalizeToolMarkup so partial
+// markers are never streamed to the user as plain text.
+export function looksLikeToolMarkerPrefix(rawTail: string): boolean {
+  if (!rawTail) return false;
+  const first = rawTail[0];
+  if (first === "`") {
+    const lower = rawTail.toLowerCase();
+    return "```json".startsWith(lower) || lower.startsWith("```");
+  }
+  if (first !== "<" && first !== "{") return false;
+  const compact = normalizeToolMarkup(rawTail).toLowerCase().replace(
+    /\s+/g,
+    "",
+  );
+  if (!compact) return false;
+  return TOOL_MARKER_COMPACT_PREFIXES.some((marker) => {
+    const n = Math.min(compact.length, marker.length);
+    return compact.slice(0, n) === marker.slice(0, n);
+  });
+}
+
+// Index in `buffer` from which the trailing text might be the start of a
+// tool-call marker that has not fully arrived yet. Everything before the index
+// is safe to stream immediately; the tail is held until the marker either
+// completes (routed as a tool call) or the stream ends (flushed as plain text).
+export function toolBridgeFlushBoundary(buffer: string): number {
+  for (let i = 0; i < buffer.length; i++) {
+    const c = buffer[i];
+    if (c === "<" || c === "{" || c === "`") {
+      if (looksLikeToolMarkerPrefix(buffer.slice(i, i + 32))) {
+        return i;
+      }
+    }
+  }
+  return buffer.length;
+}
+
 async function writeOpenAIContentStreamChunk(
   writer: WritableStreamDefaultWriter<Uint8Array>,
   encoder: TextEncoder,
@@ -7649,19 +7610,21 @@ async function processZaiToolBridgeStream(
               };
             }
 
-            // Keep a small leading buffer so XML/JSON tool-call payloads do not
-            // leak while still allowing normal natural-language answers to stream.
-            if (
-              pendingContent.length >= 512 &&
-              !shouldHoldToolBridgeTextForSieve(content)
-            ) {
-              await writeOpenAIContentStreamChunk(
-                writer,
-                encoder,
-                req.model,
-                pendingContent,
-              );
-              pendingContent = "";
+            // Stream natural-language text smoothly, but never leak a tool-call
+            // marker: when the content does not look tool-ish from the start,
+            // emit everything except a trailing segment that could be the start
+            // of a marker still arriving across chunks.
+            if (!shouldHoldToolBridgeTextForSieve(content)) {
+              const boundary = toolBridgeFlushBoundary(pendingContent);
+              if (boundary > 0) {
+                await writeOpenAIContentStreamChunk(
+                  writer,
+                  encoder,
+                  req.model,
+                  pendingContent.slice(0, boundary),
+                );
+                pendingContent = pendingContent.slice(boundary);
+              }
             }
           }
           if (pieces.reasoningContent) {
@@ -14960,4 +14923,6 @@ async function handleRequest(request: Request): Promise<Response> {
 }
 
 // 启动服务器
-main();
+if (import.meta.main) {
+  main();
+}
