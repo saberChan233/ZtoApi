@@ -4,7 +4,10 @@
 ![TypeScript](https://img.shields.io/badge/typescript-5.0+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 
-**ZtoApi** 是一个高性能的 OpenAI 兼容 API 代理服务器，专为 Z.ai 的 GLM-4.5 和 GLM-4.5V 模型设计。使用 Deno 原生 HTTP API 实现，支持完整的流式和非流式响应，提供实时监控 Dashboard，让你能够无缝地将 Z.ai 的强大 AI 能力集成到现有的 OpenAI 客户端应用中。
+**ZtoApi** 是一个高性能的 OpenAI 兼容 API 代理服务器，专为 Z.ai 的 GLM-4.5 和
+GLM-4.5V 模型设计。使用 Deno 原生 HTTP API
+实现，支持完整的流式和非流式响应，提供实时监控 Dashboard，让你能够无缝地将 Z.ai
+的强大 AI 能力集成到现有的 OpenAI 客户端应用中。
 
 ## 🌟 核心特性
 
@@ -21,29 +24,39 @@
 
 ### 🎯 **高级功能（新版特性）**
 
-- **🔄 智能 Token 池管理**: 支持多个 Token 轮换使用，自动切换失败的 Token，提升服务可用性
-- **🖼️ 完整图像处理**: 支持 base64 和远程 URL 图像上传，GLM-4.5V 专用 URL 格式转换
-- **🔍 MCP 服务器支持**: 深度网络搜索、高级搜索、编程助手、PPT 生成等高级功能
-- **🧠 智能 Header 生成**: 动态生成真实浏览器请求头和指纹参数，完美模拟真实用户请求
+- **🔄 智能 Token 池管理**: 支持多个 Token 轮换使用，自动切换失败的
+  Token，提升服务可用性
+- **🖼️ 完整图像处理**: 支持 base64 和远程 URL 图像上传，GLM-4.5V 专用 URL
+  格式转换
+- **🔧 AI 编程工具兼容**: 可接入 Kilo Code、Cline/Roo、Cursor 等
+  OpenAI-compatible 客户端；Z.ai 路径通过 tool-call bridge 降低幻觉，真实 MCP
+  需由客户端执行
+- **🧠 智能 Header 生成**:
+  动态生成真实浏览器请求头和指纹参数，完美模拟真实用户请求
 - **⚡ 高级模式检测**: 自动识别思考模式、搜索模式、视觉模型能力
-- **🔐 增强签名算法**: 双层 HMAC-SHA256 签名，支持环境变量配置，提供企业级安全保护
+- **🔐 增强签名算法**: 双层 HMAC-SHA256
+  签名，支持环境变量配置，提供企业级安全保护
 
 ## 🤖 支持的模型
 
 ZtoApi 支持 Z.ai 的多个先进 AI 模型：
 
-| 模型 ID           | 模型名称      | 特性                                        |
-| ----------------- | ------------- | ------------------------------------------- |
-| 0727-360B-API     | GLM-4.5       | 通用对话、代码生成、思考过程                |
-| glm-4.6           | GLM-4.6       | 🚀 增强模型，更强的推理和代码能力   |
-| glm-4.5v          | GLM-4.5V      | 🎯 全方位多模态理解：图像、视频、文档、音频 |
-| glm-4.6v          | GLM-4.6V      | 🚀 增强多模态：视觉理解 + 高级推理        |
-| glm-4.7           | GLM-4.7       | 🆕 最新推理模型，更强的思考和编程能力        |
-| glm-5             | GLM-5         | 🚀 下一代旗舰模型，全方位能力提升             |
-| 0727-106B-API     | GLM-4.5-Air   | ⚡ 轻量级模型，快速响应                     |
-| 0808-360B-DR       | 0808-360B-DR   | 🔬 深度研究专用模型                        |
+| 模型 ID       | 模型名称     | 特性                                        |
+| ------------- | ------------ | ------------------------------------------- |
+| 0727-360B-API | GLM-4.5      | 通用对话、代码生成、思考过程                |
+| glm-4.6       | GLM-4.6      | 🚀 增强模型，更强的推理和代码能力           |
+| glm-4.5v      | GLM-4.5V     | 🎯 全方位多模态理解：图像、视频、文档、音频 |
+| glm-4.6v      | GLM-4.6V     | 🚀 增强多模态：视觉理解 + 高级推理          |
+| glm-4.7       | GLM-4.7      | 🆕 最新推理模型，更强的思考和编程能力       |
+| glm-5         | GLM-5        | 🚀 下一代旗舰模型，全方位能力提升           |
+| 0727-106B-API | GLM-4.5-Air  | ⚡ 轻量级模型，快速响应                     |
+| 0808-360B-DR  | 0808-360B-DR | 🔬 深度研究专用模型                         |
 
-> ⚠️ **关于工具调用**: ZtoApi 已完整支持 OpenAI 格式的 `tools` 参数解析和转发，但实际工具调用功能受限于上游 Z.ai API。建议使用 `reasoning: true` 参数启用思考模式。
+> ⚠️ **关于工具调用**: OpenAI-compatible / Anthropic provider 支持真实 OpenAI
+> `tool_calls`。Z.ai 上游不是标准 OpenAI tool-call API，ZtoApi 只能通过 bridge
+> 把模型输出转换成 OpenAI
+> `tool_calls`，并禁止模型在未收到工具结果前声称已读取项目文件。AI
+> 编程插件中的文件/MCP工具仍由插件侧执行。
 
 ### 模型特性对比
 
@@ -92,7 +105,11 @@ ZtoApi 支持 Z.ai 的多个先进 AI 模型：
 - ✅ 🎯 全方位能力提升
 - ❌ 原生多模态理解
 
-> ⚠️ **关于工具调用**: ZtoApi 已完整支持 OpenAI 格式的 `tools` 参数解析和转发，但实际工具调用功能受限于上游 Z.ai API。目前测试显示 `/api/v2/chat/completions` 端点可能未完全启用工具调用功能，建议使用 `reasoning: true` 参数启用思考模式以获得类似的推理能力。
+> ⚠️ **关于工具调用**: Z.ai 路径默认启用
+> `ZAI_TOOL_CALL_BRIDGE`，会尝试把模型生成的工具 JSON 转成标准 OpenAI
+> `tool_calls`；如果用户要求分析项目/读取目录但模型没有发起工具调用，会安全回退为一次文件/目录探测工具调用，避免直接编造目录结构。若要实验
+> Z.ai 内部 `tool_servers`，需显式设置
+> `ZAI_FORWARD_OPENAI_TOOLS=true`，不建议默认开启。
 
 **GLM-4.5-Air** (`0727-106B-API`) - ⚡ 轻量级模型
 
@@ -147,7 +164,8 @@ ZtoApi 支持 Z.ai 的多个先进 AI 模型：
 | 📄 **文档** | PDF, DOC, TXT        | 文档分析、信息提取、摘要生成   |
 | 🎵 **音频** | MP3, WAV, AAC        | 语音转文字、音频分析、内容理解 |
 
-> ⚠️ **重要提示**: 多模态功能（图像、视频、文档、音频）需要**正式的 Z.ai API Token**，匿名 token 不支持多媒体处理。
+> ⚠️ **重要提示**: 多模态功能（图像、视频、文档、音频）需要**正式的 Z.ai API
+> Token**，匿名 token 不支持多媒体处理。
 
 ## 🚀 高级功能详解
 
@@ -175,6 +193,93 @@ export ZAI_TOKENS="token1,token2,token3"
 export ZAI_TOKENS="token1,token2"
 # 匿名 Token 自动作为备用
 ```
+
+### 🤖 **AI Provider 配置**
+
+除默认的 Z.ai provider 外，ZtoApi 现在可以把 OpenAI 兼容请求路由到其他
+provider。模型 ID 支持两种写法：
+
+- `/v1/models` 返回的带前缀模型，例如
+  `openai/gpt-4o-mini`、`anthropic/claude-3-5-sonnet-latest`、`ollama/llama3.1`
+- 已配置 provider 的无前缀模型名，例如请求 `gpt-4o-mini` 会匹配 `OPENAI_MODELS`
+  中的同名模型
+
+#### OpenAI / OpenAI-compatible
+
+```bash
+export OPENAI_ENABLED=true
+export OPENAI_API_KEY="sk-..."
+export OPENAI_BASE_URL="https://api.openai.com/v1"
+export OPENAI_MODELS="gpt-4o-mini,gpt-4.1-mini"
+```
+
+任意 OpenAI-compatible provider 可通过 `CUSTOM_PROVIDER_IDS` 接入：
+
+```bash
+export CUSTOM_PROVIDER_IDS="deepseek,siliconflow"
+export DEEPSEEK_NAME="DeepSeek"
+export DEEPSEEK_BASE_URL="https://api.deepseek.com/v1"
+export DEEPSEEK_API_KEY="sk-..."
+export DEEPSEEK_MODELS="deepseek-chat,deepseek-reasoner"
+export SILICONFLOW_BASE_URL="https://api.siliconflow.cn/v1"
+export SILICONFLOW_API_KEY="sk-..."
+export SILICONFLOW_MODELS="Qwen/Qwen2.5-72B-Instruct"
+```
+
+#### Anthropic
+
+Anthropic 会在入口处把 OpenAI `messages` 请求转换为 `/v1/messages`
+请求，并把非流式 / 流式响应转换回 OpenAI 兼容格式。
+
+```bash
+export ANTHROPIC_ENABLED=true
+export ANTHROPIC_API_KEY="sk-ant-..."
+export ANTHROPIC_MODELS="claude-3-5-sonnet-latest,claude-3-5-haiku-latest"
+```
+
+#### Ollama
+
+```bash
+export OLLAMA_ENABLED=true
+export OLLAMA_BASE_URL="http://127.0.0.1:11434/v1"
+export OLLAMA_MODELS="llama3.1,qwen2.5"
+```
+
+> 默认 Z.ai 路径仍保留原有 token pool、匿名
+> token、captcha、图像上传和会话恢复逻辑；非 Z.ai provider 会走通用
+> OpenAI-compatible / Anthropic 转发路径。
+
+#### AI 编程工具、Tool Call 与 MCP 支持边界
+
+ZtoApi 可以作为 OpenAI-compatible endpoint 接入 Cursor、Cline/Roo
+Code、Continue、Cherry Studio、Open WebUI 等客户端：
+
+```text
+Base URL: http://127.0.0.1:9090/v1
+API Key: 你的 DEFAULT_KEY
+Model: /v1/models 返回的模型 ID
+```
+
+Tool call 支持按 provider 分层：
+
+- **OpenAI-compatible provider**：`tools`、`tool_choice`、`tool_calls`、`tool`
+  role 消息会透传给上游，适合需要 agent
+  工具调用的编程工具；实际可用性取决于上游模型和客户端。
+- **Anthropic provider**：会在入口处转换 OpenAI `tools` / `tool_calls` / `tool`
+  role 消息到 Anthropic `/v1/messages`，并把 Anthropic `tool_use` /
+  `tool_result` 风格响应转换回 OpenAI-compatible
+  `tool_calls`；支持基础非流式和流式 tool call 协议转换。
+- **Z.ai 默认 provider**：会接收 OpenAI `tools` 并把工具名传给 Z.ai 上游的内部
+  `tool_servers` 字段，但这不是标准 OpenAI `tool_calls`
+  完整闭环，实际工具调用能力受 Z.ai 上游限制。
+- **Ollama provider**：按 OpenAI-compatible 方式透传，是否支持 tool call 取决于
+  Ollama 版本和具体模型。
+
+MCP 支持边界：当前 README 中的 MCP 指 Z.ai 上游预置的内部能力（如
+`deep-web-search`、`advanced-search` 等），并不是通用 MCP client/server。ZtoApi
+当前不会自动连接本地 filesystem/github 等 MCP server，也不会把 MCP
+工具自动桥接成 OpenAI `tools`。如果需要完整 MCP 网关，还需要新增 MCP
+client、工具发现、工具执行和 `tool_result` 回传层。
 
 #### 🎯 **使用场景**
 
@@ -223,20 +328,22 @@ export ZAI_TOKENS="token1,token2"
 
 ---
 
-### 🔍 **MCP 服务器支持**
+### 🔍 **Z.ai 预置工具能力（非通用 MCP 网关）**
 
-支持 Z.ai 的 Model Context Protocol (MCP) 高级功能：
+以下名称来自 Z.ai 上游预置能力/历史兼容配置，不代表 ZtoApi 已实现通用 MCP
+client/server，也不代表可以直接读取你的本地项目文件。AI 编程插件里的
+filesystem/MCP 工具仍由插件侧执行。
 
 #### 🚀 **可用的 MCP 服务器**
 
-| 服务器名称        | 功能描述     | 支持模型         | 状态        |
-| ----------------- | ------------ | ---------------- | ----------- |
-| `deep-web-search` | 深度网络搜索 | GLM-4.5, GLM-4.6 | ✅ 可用     |
-| `advanced-search` | 高级搜索     | GLM-4.6          | ✅ 可用     |
-| `vibe-coding`     | 编程助手     | GLM-4.5, GLM-4.6 | 🔒 隐藏特性 |
-| `ppt-maker`       | PPT 生成     | GLM-4.5, GLM-4.6 | 🔒 隐藏特性 |
-| `image-search`    | 图像搜索     | GLM-4.5, GLM-4.6 | 🔒 隐藏特性 |
-| `deep-research`   | 深度研究     | GLM-4.5, GLM-4.6 | 🔒 隐藏特性 |
+| 名称              | 含义         | 说明                |
+| ----------------- | ------------ | ------------------- |
+| `deep-web-search` | 深度网络搜索 | Z.ai 上游预置能力名 |
+| `advanced-search` | 高级搜索     | Z.ai 上游预置能力名 |
+| `vibe-coding`     | 编程助手     | 上游隐藏/实验能力名 |
+| `ppt-maker`       | PPT 生成     | 上游隐藏/实验能力名 |
+| `image-search`    | 图像搜索     | 上游隐藏/实验能力名 |
+| `deep-research`   | 深度研究     | 上游隐藏/实验能力名 |
 
 #### 🎯 **自动模式检测**
 
@@ -324,7 +431,8 @@ export ZAI_SIGNING_SECRET="6b65792d40404040292929282928283929292d787878782626262
 4. 查看 Local Storage 中的认证 token
 5. 复制 token 值设置为环境变量
 
-> ⚠️ **注意**: 方式 2 获取的 token 可能有时效性，建议使用方式 1 获取长期有效的 API Token。
+> ⚠️ **注意**: 方式 2 获取的 token 可能有时效性，建议使用方式 1 获取长期有效的
+> API Token。
 
 ## 部署方式
 
@@ -373,15 +481,16 @@ Deno Deploy 是一个全球分布式的边缘计算平台，非常适合部署 D
 
 #### 📄 部署后页面介绍
 
-部署完成后，可通过你的 Deno Deploy 域名访问以下页面（完整端点说明见下文「服务端点访问」）：
+部署完成后，可通过你的 Deno Deploy
+域名访问以下页面（完整端点说明见下文「服务端点访问」）：
 
-| 页面 | 路径 | 说明 |
-| ---- | ---- | ---- |
-| 🏠 服务首页 | `/` | 功能概览与导航入口 |
-| 📊 监控面板 | `/dashboard` | 实时请求统计与性能指标（可通过 `DASHBOARD_ENABLED` 关闭） |
-| 📚 API 文档 | `/docs` | 完整接口说明与示例 |
-| 📋 模型列表 | `/v1/models` | 可用模型与状态 |
-| 🤖 聊天接口 | `/v1/chat/completions` | OpenAI 兼容主接口 |
+| 页面        | 路径                   | 说明                                                      |
+| ----------- | ---------------------- | --------------------------------------------------------- |
+| 🏠 服务首页 | `/`                    | 功能概览与导航入口                                        |
+| 📊 监控面板 | `/dashboard`           | 实时请求统计与性能指标（可通过 `DASHBOARD_ENABLED` 关闭） |
+| 📚 API 文档 | `/docs`                | 完整接口说明与示例                                        |
+| 📋 模型列表 | `/v1/models`           | 可用模型与状态                                            |
+| 🤖 聊天接口 | `/v1/chat/completions` | OpenAI 兼容主接口                                         |
 
 ### 2. 本地开发运行
 
@@ -617,10 +726,10 @@ WantedBy=multi-user.target
 
 ### 🔴 高级配置（通常无需修改）
 
-| 变量名         | 说明                   | 默认值                                             | 示例值         |
-| -------------- | ---------------------- | -------------------------------------------------- | -------------- |
+| 变量名         | 说明                   | 默认值                                      | 示例值         |
+| -------------- | ---------------------- | ------------------------------------------- | -------------- |
 | `UPSTREAM_URL` | Z.ai 上游 API 地址     | `https://chat.z.ai/api/v2/chat/completions` | 自定义代理地址 |
-| `PORT`         | 服务器端口（仅自托管） | `9090`                                             | `8080`         |
+| `PORT`         | 服务器端口（仅自托管） | `9090`                                      | `8080`         |
 
 ### 🎯 **配置优先级说明**
 
@@ -645,7 +754,8 @@ WantedBy=multi-user.target
 
 ### ⚠️ **重要提醒**
 
-- **多模态功能**: 必须设置 `ZAI_TOKEN` 或 `ZAI_TOKENS` 才能使用图像、视频、文档、音频功能
+- **多模态功能**: 必须设置 `ZAI_TOKEN` 或 `ZAI_TOKENS`
+  才能使用图像、视频、文档、音频功能
 - **Token 权限**: 匿名 Token 仅支持文本对话，正式 Token 支持全部功能
 - **签名安全**: 新版签名算法提供企业级安全保障
 - **高可用**: 强烈建议配置多个 Token 避免单点故障
@@ -872,7 +982,6 @@ curl -X POST https://your-project.deno.dev/v1/chat/completions \
     "messages": [{"role": "user", "content": "请写一首诗"}],
     "stream": true
   }'
-
 ```
 
 ### 🟨 JavaScript 示例
@@ -893,7 +1002,7 @@ async function chatWithGLM45(message, stream = false) {
         messages: [{ role: "user", content: message }],
         stream: stream,
       }),
-    }
+    },
   );
 
   const data = await response.json();
@@ -924,7 +1033,7 @@ async function analyzeImage(text, imageUrl) {
           },
         ],
       }),
-    }
+    },
   );
 
   const data = await response.json();
@@ -953,7 +1062,7 @@ async function analyzeVideo(text, videoUrl) {
           },
         ],
       }),
-    }
+    },
   );
 
   const data = await response.json();
@@ -982,7 +1091,7 @@ async function analyzeDocument(text, documentUrl) {
           },
         ],
       }),
-    }
+    },
   );
 
   const data = await response.json();
@@ -994,17 +1103,21 @@ async function analyzeMultimedia(text, mediaUrls) {
   const content = [{ type: "text", text: text }];
 
   // 添加各种媒体类型
-  if (mediaUrls.image)
+  if (mediaUrls.image) {
     content.push({ type: "image_url", image_url: { url: mediaUrls.image } });
-  if (mediaUrls.video)
+  }
+  if (mediaUrls.video) {
     content.push({ type: "video_url", video_url: { url: mediaUrls.video } });
-  if (mediaUrls.document)
+  }
+  if (mediaUrls.document) {
     content.push({
       type: "document_url",
       document_url: { url: mediaUrls.document },
     });
-  if (mediaUrls.audio)
+  }
+  if (mediaUrls.audio) {
     content.push({ type: "audio_url", audio_url: { url: mediaUrls.audio } });
+  }
 
   const response = await fetch(
     "https://your-project.deno.dev/v1/chat/completions",
@@ -1018,7 +1131,7 @@ async function analyzeMultimedia(text, mediaUrls) {
         model: "glm-4.5v",
         messages: [{ role: "user", content }],
       }),
-    }
+    },
   );
 
   const data = await response.json();
@@ -1145,10 +1258,10 @@ analyzeMultimedia("综合分析这些内容", {
 
 #### 🔐 **签名算法问题（新版）**
 
-| 问题                 | 排查步骤                                                                        | 解决方案           |
-| -------------------- | ------------------------------------------------------------------------------- | ------------------ |
-| 签名验证失败         | 1. 检查 `ZAI_SIGNING_SECRET` 配置<br>2. 确认密钥格式正确<br>3. 查看签名生成日志 | 使用正确的密钥格式 |
-| 签名参数不匹配     | 1. 检查时间窗口同步<br>2. 验证请求参数格式<br>3. 确认密钥使用正确         | 调整参数配置 |
+| 问题           | 排查步骤                                                                        | 解决方案           |
+| -------------- | ------------------------------------------------------------------------------- | ------------------ |
+| 签名验证失败   | 1. 检查 `ZAI_SIGNING_SECRET` 配置<br>2. 确认密钥格式正确<br>3. 查看签名生成日志 | 使用正确的密钥格式 |
+| 签名参数不匹配 | 1. 检查时间窗口同步<br>2. 验证请求参数格式<br>3. 确认密钥使用正确               | 调整参数配置       |
 
 #### 🧠 **高级功能问题（新版）**
 
@@ -1158,7 +1271,8 @@ analyzeMultimedia("综合分析这些内容", {
 | 搜索功能不工作 | 1. 检查 MCP 服务器配置<br>2. 确认模型支持搜索功能<br>3. 查看功能检测日志      | 使用支持搜索的模型          |
 | 图像上传失败   | 1. 检查 Token 权限<br>2. 确认图像格式和大小<br>3. 查看上传错误日志            | 使用有效的 Token 和正确格式 |
 
-> ⚠️ **重要**: 如果使用匿名 token（未设置`ZAI_TOKEN`），多媒体请求会被 Z.ai 服务器拒绝。
+> ⚠️ **重要**: 如果使用匿名 token（未设置`ZAI_TOKEN`），多媒体请求会被 Z.ai
+> 服务器拒绝。
 
 **支持的多模态消息格式：**
 
@@ -1314,7 +1428,8 @@ export DEBUG_MODE=false                           # 避免敏感信息泄露
 如果遇到问题，可以通过以下方式获取帮助：
 
 1. 查看 Deno 官方文档: [https://deno.land/manual](https://deno.land/manual)
-2. 访问 Deno Deploy 文档: [https://deno.com/deploy/docs](https://deno.com/deploy/docs)
+2. 访问 Deno Deploy 文档:
+   [https://deno.com/deploy/docs](https://deno.com/deploy/docs)
 3. 提交 Issue 到原项目仓库
 
 ## 🤝 贡献和支持

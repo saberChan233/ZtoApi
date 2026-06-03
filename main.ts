@@ -68,20 +68,37 @@ declare namespace Deno {
     readonly stdin: WritableStream<Uint8Array>;
     readonly stdout: ReadableStream<Uint8Array>;
     readonly stderr: ReadableStream<Uint8Array>;
-    readonly status: Promise<{ success: boolean; code: number; signal?: string }>;
+    readonly status: Promise<
+      { success: boolean; code: number; signal?: string }
+    >;
     kill(signo?: string): void;
   }
 
   namespace env {
     function get(key: string): string | undefined;
+    function toObject(): Record<string, string>;
   }
 
   function kill(pid: number, signo?: string): void;
 
   function makeTempFile(options?: { suffix?: string }): Promise<string>;
   function readTextFile(path: string | URL): Promise<string>;
+  function readTextFileSync(path: string | URL): string;
+  function writeTextFile(path: string | URL, data: string): Promise<void>;
+  function writeTextFileSync(path: string | URL, data: string): void;
+  function readFile(path: string | URL): Promise<Uint8Array>;
+  function writeFile(path: string | URL, data: Uint8Array): Promise<void>;
+  function mkdir(
+    path: string | URL,
+    options?: { recursive?: boolean },
+  ): Promise<void>;
   function remove(path: string | URL): Promise<void>;
+  function removeSync(path: string | URL): void;
+  function renameSync(oldpath: string | URL, newpath: string | URL): void;
   function stat(path: string | URL): Promise<{ isFile: boolean }>;
+  namespace errors {
+    class NotFound extends Error {}
+  }
 }
 
 /**
@@ -131,17 +148,78 @@ interface Tool {
 /**
  * 工具选择策略
  */
-type ToolChoice = "none" | "auto" | { type: "function"; function: { name: string } };
+type ToolChoice = "none" | "auto" | "required" | {
+  type: "function";
+  function: { name: string };
+};
+
+interface ToolCall {
+  id: string;
+  type: "function";
+  function: {
+    name: string;
+    arguments: string;
+  };
+}
+
+interface ToolCallDelta {
+  index: number;
+  id?: string;
+  type?: "function";
+  function?: {
+    name?: string;
+    arguments?: string;
+  };
+}
 
 interface OpenAIRequest {
   model: string;
   messages: Message[];
   stream?: boolean;
   temperature?: number;
+  top_p?: number;
   max_tokens?: number;
+  stop?: string | string[];
+  presence_penalty?: number;
+  frequency_penalty?: number;
+  response_format?: Record<string, unknown>;
+  user?: string;
   reasoning?: boolean;
+  conversation_id?: string;
   tools?: Tool[];
   tool_choice?: ToolChoice;
+  parallel_tool_calls?: boolean;
+}
+
+interface ResponsesRequest {
+  model: string;
+  input?: unknown;
+  instructions?: string;
+  stream?: boolean;
+  temperature?: number;
+  top_p?: number;
+  max_output_tokens?: number;
+  max_tokens?: number;
+  tools?: Array<Record<string, any>>;
+  tool_choice?: ToolChoice | string | Record<string, any>;
+  previous_response_id?: string;
+}
+
+interface AnthropicMessage {
+  role: string;
+  content: string | Array<Record<string, any>>;
+}
+
+interface AnthropicMessagesRequest {
+  model: string;
+  max_tokens?: number;
+  messages: AnthropicMessage[];
+  system?: string | Array<Record<string, any>>;
+  stream?: boolean;
+  temperature?: number;
+  top_p?: number;
+  tools?: Array<Record<string, any>>;
+  tool_choice?: string | Record<string, any>;
 }
 
 /**
@@ -150,16 +228,21 @@ interface OpenAIRequest {
  */
 interface Message {
   role: string;
+  name?: string;
+  reasoning_content?: string;
+  tool_call_id?: string;
+  tool_calls?: ToolCall[];
   content:
     | string
     | Array<{
-        type: string;
-        text?: string;
-        image_url?: { url: string };
-        video_url?: { url: string };
-        document_url?: { url: string };
-        audio_url?: { url: string };
-      }>;
+      type: string;
+      text?: string;
+      image_url?: { url: string };
+      video_url?: { url: string };
+      document_url?: { url: string };
+      audio_url?: { url: string };
+    }>
+    | null;
 }
 
 /**
@@ -260,6 +343,8 @@ interface Choice {
 interface Delta {
   role?: string;
   content?: string;
+  reasoning_content?: string;
+  tool_calls?: ToolCallDelta[];
 }
 
 interface Usage {
@@ -310,6 +395,8 @@ interface Model {
   object: string;
   created: number;
   owned_by: string;
+  display_name?: string;
+  provider?: string;
 }
 
 /**
@@ -332,12 +419,37 @@ interface ModelCapabilities {
   mcp: boolean;
 }
 
+type AIProviderKind = "zai" | "openai-compatible" | "anthropic";
+
+interface AIProviderConfig {
+  id: string;
+  name: string;
+  kind: AIProviderKind;
+  enabled: boolean;
+  baseUrl: string;
+  apiKey: string;
+  models: string[];
+  ownedBy: string;
+  envPrefix: string;
+  apiKeyHeader?: string;
+  authScheme?: "bearer" | "x-api-key" | "none";
+}
+
+interface AIProviderResolution {
+  provider: AIProviderConfig;
+  upstreamModel: string;
+  requestedModel: string;
+  exposedModelId: string;
+}
+
 /**
  * 配置常量定义
  */
 
 // 思考内容处理策略: strip-去除<details>标签, think-转为<thinking>标签, raw-保留原样
 const THINK_TAGS_MODE = "strip";
+const THINKING_OUTPUT_MODE =
+  (Deno.env.get("THINKING_OUTPUT_MODE") || "answer_only").trim().toLowerCase();
 
 // MCP 服务器配置
 const MCP_SERVERS: Record<string, MCPServerConfig> = {
@@ -380,49 +492,60 @@ class ModelCapabilityDetector {
   /**
    * 检测模型的高级能力
    */
-  static detectCapabilities(modelId: string, reasoning?: boolean): ModelCapabilities {
-    const normalizedModelId = modelId.toLowerCase();
+  static detectCapabilities(
+    modelId: string,
+    reasoning?: boolean,
+  ): ModelCapabilities {
+    const modelConfig = getModelConfig(modelId);
+    const normalizedModelId = normalizeModelId(modelId).toLowerCase();
 
     return {
-      thinking: this.isThinkingModel(normalizedModelId, reasoning),
+      thinking: modelConfig.capabilities.thinking ||
+        this.isThinkingModel(normalizedModelId, reasoning),
       search: this.isSearchModel(normalizedModelId),
       advancedSearch: this.isAdvancedSearchModel(normalizedModelId),
-      vision: this.isVisionModel(normalizedModelId),
-      mcp: this.supportsMCP(normalizedModelId),
+      vision: modelConfig.capabilities.vision ||
+        this.isVisionModel(normalizedModelId),
+      mcp: modelConfig.capabilities.mcp || this.supportsMCP(normalizedModelId),
     };
   }
 
-  private static isThinkingModel(modelId: string, reasoning?: boolean): boolean {
+  private static isThinkingModel(
+    modelId: string,
+    reasoning?: boolean,
+  ): boolean {
     return modelId.includes("thinking") ||
-           modelId.includes("4.6") ||
-           reasoning === true ||
-           modelId.includes("0727-360b-api");
+      modelId.includes("4.6") ||
+      modelId.includes("4.7") ||
+      modelId.includes("glm-5") ||
+      reasoning === true ||
+      modelId.includes("0727-360b-api");
   }
 
   private static isSearchModel(modelId: string): boolean {
     return modelId.includes("search") ||
-           modelId.includes("web") ||
-           modelId.includes("browser");
+      modelId.includes("web") ||
+      modelId.includes("browser");
   }
 
   private static isAdvancedSearchModel(modelId: string): boolean {
     return modelId.includes("advanced-search") ||
-           modelId.includes("advanced") ||
-           modelId.includes("pro-search");
+      modelId.includes("advanced") ||
+      modelId.includes("pro-search");
   }
 
   private static isVisionModel(modelId: string): boolean {
     return modelId.includes("4.5v") ||
-           modelId.includes("vision") ||
-           modelId.includes("image") ||
-           modelId.includes("multimodal");
+      modelId.includes("vision") ||
+      modelId.includes("image") ||
+      modelId.includes("multimodal");
   }
 
   private static supportsMCP(modelId: string): boolean {
     // 大部分高级模型都支持 MCP
     return this.isThinkingModel(modelId) ||
-           this.isSearchModel(modelId) ||
-           this.isAdvancedSearchModel(modelId);
+      this.isSearchModel(modelId) ||
+      this.isAdvancedSearchModel(modelId);
   }
 
   /**
@@ -440,7 +563,9 @@ class ModelCapabilityDetector {
     // 添加隐藏的 MCP 服务器特性
     if (capabilities.mcp) {
       // 这些服务器作为隐藏特性添加到 features 中
-      debugLog("模型支持隐藏 MCP 特性: vibe-coding, ppt-maker, image-search, deep-research");
+      debugLog(
+        "模型支持隐藏 MCP 特性: vibe-coding, ppt-maker, image-search, deep-research",
+      );
     }
 
     return servers;
@@ -449,12 +574,14 @@ class ModelCapabilityDetector {
   /**
    * 获取隐藏的 MCP 特性列表
    */
-  static getHiddenMCPFeatures(): Array<{ type: string; server: string; status: string }> {
+  static getHiddenMCPFeatures(): Array<
+    { type: string; server: string; status: string }
+  > {
     return [
       { type: "mcp", server: "vibe-coding", status: "hidden" },
       { type: "mcp", server: "ppt-maker", status: "hidden" },
       { type: "mcp", server: "image-search", status: "hidden" },
-      { type: "mcp", server: "deep-research", status: "hidden" }
+      { type: "mcp", server: "deep-research", status: "hidden" },
     ];
   }
 }
@@ -471,7 +598,9 @@ class SmartHeaderGenerator {
   /**
    * 生成智能浏览器头部
    */
-  static async generateHeaders(chatId: string = ""): Promise<Record<string, string>> {
+  static async generateHeaders(
+    chatId: string = "",
+  ): Promise<Record<string, string>> {
     // 检查缓存
     const now = Date.now();
     if (this.cachedHeaders && this.cacheExpiry > now) {
@@ -496,10 +625,10 @@ class SmartHeaderGenerator {
   }
 
   private static async generateFreshHeaders(): Promise<Record<string, string>> {
-      return {
-        // 基础头部
-        "Accept": "*/*",
-        "Accept-Language": getPreferredBrowserAcceptLanguage(),
+    return {
+      // 基础头部
+      "Accept": "*/*",
+      "Accept-Language": getPreferredBrowserAcceptLanguage(),
       "Accept-Encoding": "gzip, deflate, br, zstd",
       "Cache-Control": "no-cache",
       "Connection": "keep-alive",
@@ -517,7 +646,7 @@ class SmartHeaderGenerator {
 
       // Z.AI 特定头部
       "Origin": ORIGIN_BASE,
-      "Referer": "",
+      "Referer": `${ORIGIN_BASE}/`,
       "X-Fe-Version": X_FE_VERSION,
       "X-Region": BROWSER_REGION,
     };
@@ -544,7 +673,7 @@ class BrowserFingerprintGenerator {
     timestamp: number,
     requestId: string,
     token: string,
-    chatId: string = ""
+    chatId: string = "",
   ): Record<string, string> {
     // 从 JWT token 提取用户 ID（多字段支持，与 Python 版本一致）
     let userId = "guest";
@@ -591,10 +720,12 @@ class BrowserFingerprintGenerator {
       // 屏幕参数
       "screen_width": getPreferredBrowserScreenWidth(),
       "screen_height": getPreferredBrowserScreenHeight(),
-      "screen_resolution": `${getPreferredBrowserScreenWidth()}x${getPreferredBrowserScreenHeight()}`,
+      "screen_resolution":
+        `${getPreferredBrowserScreenWidth()}x${getPreferredBrowserScreenHeight()}`,
       "viewport_height": getPreferredBrowserViewportHeight(),
       "viewport_width": getPreferredBrowserViewportWidth(),
-      "viewport_size": `${getPreferredBrowserViewportWidth()}x${getPreferredBrowserViewportHeight()}`,
+      "viewport_size":
+        `${getPreferredBrowserViewportWidth()}x${getPreferredBrowserViewportHeight()}`,
       "color_depth": getPreferredBrowserColorDepth(),
       "pixel_ratio": getPreferredBrowserPixelRatio(),
 
@@ -629,16 +760,13 @@ class BrowserFingerprintGenerator {
 
 // 伪装前端头部（来自抓包分析）
 const X_FE_VERSION = Deno.env.get("UPSTREAM_X_FE_VERSION") || "prod-fe-1.1.35";
-const BROWSER_UA =
-  Deno.env.get("UPSTREAM_BROWSER_UA") ||
+const BROWSER_UA = Deno.env.get("UPSTREAM_BROWSER_UA") ||
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0";
-const SEC_CH_UA =
-  Deno.env.get("UPSTREAM_SEC_CH_UA") ||
+const SEC_CH_UA = Deno.env.get("UPSTREAM_SEC_CH_UA") ||
   '"Chromium";v="148", "Microsoft Edge";v="148", "Not/A)Brand";v="99"';
 const SEC_CH_UA_MOB = Deno.env.get("UPSTREAM_SEC_CH_UA_MOBILE") || "?0";
 const SEC_CH_UA_PLAT = Deno.env.get("UPSTREAM_SEC_CH_UA_PLATFORM") || '"Linux"';
-const BROWSER_TITLE =
-  Deno.env.get("UPSTREAM_BROWSER_TITLE") ||
+const BROWSER_TITLE = Deno.env.get("UPSTREAM_BROWSER_TITLE") ||
   "Z.ai - Free AI Chatbot & Agent powered by GLM-5.1 & GLM-5";
 const BROWSER_NAME = Deno.env.get("UPSTREAM_BROWSER_NAME") || "Chrome";
 const BROWSER_OS_NAME = Deno.env.get("UPSTREAM_BROWSER_OS_NAME") || "Linux";
@@ -647,24 +775,35 @@ const BROWSER_NAVIGATOR_PLATFORM =
 const ORIGIN_BASE = "https://chat.z.ai";
 const BROWSER_REGION = Deno.env.get("UPSTREAM_BROWSER_REGION") || "overseas";
 const BROWSER_LANGUAGE = Deno.env.get("UPSTREAM_BROWSER_LANGUAGE") || "zh-CN";
-const BROWSER_LANGUAGES = Deno.env.get("UPSTREAM_BROWSER_LANGUAGES") || "zh-CN,en,en-GB,en-US";
-const BROWSER_TIMEZONE = Deno.env.get("UPSTREAM_BROWSER_TIMEZONE") || "Asia/Shanghai";
-const BROWSER_TIMEZONE_OFFSET = Deno.env.get("UPSTREAM_BROWSER_TIMEZONE_OFFSET") || "-480";
-const BROWSER_SCREEN_WIDTH = Deno.env.get("UPSTREAM_BROWSER_SCREEN_WIDTH") || "1552";
-const BROWSER_SCREEN_HEIGHT = Deno.env.get("UPSTREAM_BROWSER_SCREEN_HEIGHT") || "970";
-const BROWSER_VIEWPORT_WIDTH = Deno.env.get("UPSTREAM_BROWSER_VIEWPORT_WIDTH") || "1544";
-const BROWSER_VIEWPORT_HEIGHT = Deno.env.get("UPSTREAM_BROWSER_VIEWPORT_HEIGHT") || "812";
-const BROWSER_COLOR_DEPTH = Deno.env.get("UPSTREAM_BROWSER_COLOR_DEPTH") || "30";
-const BROWSER_PIXEL_RATIO = Deno.env.get("UPSTREAM_BROWSER_PIXEL_RATIO") || "1.649999976158142";
+const BROWSER_LANGUAGES = Deno.env.get("UPSTREAM_BROWSER_LANGUAGES") ||
+  "zh-CN,en,en-GB,en-US";
+const BROWSER_TIMEZONE = Deno.env.get("UPSTREAM_BROWSER_TIMEZONE") ||
+  "Asia/Shanghai";
+const BROWSER_TIMEZONE_OFFSET =
+  Deno.env.get("UPSTREAM_BROWSER_TIMEZONE_OFFSET") || "-480";
+const BROWSER_SCREEN_WIDTH = Deno.env.get("UPSTREAM_BROWSER_SCREEN_WIDTH") ||
+  "1552";
+const BROWSER_SCREEN_HEIGHT = Deno.env.get("UPSTREAM_BROWSER_SCREEN_HEIGHT") ||
+  "970";
+const BROWSER_VIEWPORT_WIDTH =
+  Deno.env.get("UPSTREAM_BROWSER_VIEWPORT_WIDTH") || "1544";
+const BROWSER_VIEWPORT_HEIGHT =
+  Deno.env.get("UPSTREAM_BROWSER_VIEWPORT_HEIGHT") || "812";
+const BROWSER_COLOR_DEPTH = Deno.env.get("UPSTREAM_BROWSER_COLOR_DEPTH") ||
+  "30";
+const BROWSER_PIXEL_RATIO = Deno.env.get("UPSTREAM_BROWSER_PIXEL_RATIO") ||
+  "1.649999976158142";
 let IMPORTED_BROWSER_REQUEST_PROFILE: Partial<BrowserRequestProfile> = {};
 let IMPORTED_BROWSER_FINGERPRINT_PROFILE: Record<string, string> = {};
 
 function getPreferredBrowserUserAgent(): string {
-  return IMPORTED_BROWSER_REQUEST_PROFILE.userAgent || IMPORTED_BROWSER_FINGERPRINT_PROFILE.user_agent || BROWSER_UA;
+  return IMPORTED_BROWSER_REQUEST_PROFILE.userAgent ||
+    IMPORTED_BROWSER_FINGERPRINT_PROFILE.user_agent || BROWSER_UA;
 }
 
 function getPreferredBrowserAcceptLanguage(): string {
-  return IMPORTED_BROWSER_REQUEST_PROFILE.acceptLanguage || IMPORTED_BROWSER_FINGERPRINT_PROFILE.language || BROWSER_LANGUAGE;
+  return IMPORTED_BROWSER_REQUEST_PROFILE.acceptLanguage ||
+    IMPORTED_BROWSER_FINGERPRINT_PROFILE.language || BROWSER_LANGUAGE;
 }
 
 function normalizePrimaryLanguage(value: string): string {
@@ -673,7 +812,9 @@ function normalizePrimaryLanguage(value: string): string {
 
 function getPreferredBrowserLanguage(): string {
   return IMPORTED_BROWSER_FINGERPRINT_PROFILE.language ||
-    normalizePrimaryLanguage(IMPORTED_BROWSER_REQUEST_PROFILE.acceptLanguage || BROWSER_LANGUAGE);
+    normalizePrimaryLanguage(
+      IMPORTED_BROWSER_REQUEST_PROFILE.acceptLanguage || BROWSER_LANGUAGE,
+    );
 }
 
 function getPreferredSecChUa(): string {
@@ -697,31 +838,38 @@ function getPreferredBrowserTimezone(): string {
 }
 
 function getPreferredBrowserTimezoneOffset(): string {
-  return IMPORTED_BROWSER_FINGERPRINT_PROFILE.timezone_offset || BROWSER_TIMEZONE_OFFSET;
+  return IMPORTED_BROWSER_FINGERPRINT_PROFILE.timezone_offset ||
+    BROWSER_TIMEZONE_OFFSET;
 }
 
 function getPreferredBrowserScreenWidth(): string {
-  return IMPORTED_BROWSER_FINGERPRINT_PROFILE.screen_width || BROWSER_SCREEN_WIDTH;
+  return IMPORTED_BROWSER_FINGERPRINT_PROFILE.screen_width ||
+    BROWSER_SCREEN_WIDTH;
 }
 
 function getPreferredBrowserScreenHeight(): string {
-  return IMPORTED_BROWSER_FINGERPRINT_PROFILE.screen_height || BROWSER_SCREEN_HEIGHT;
+  return IMPORTED_BROWSER_FINGERPRINT_PROFILE.screen_height ||
+    BROWSER_SCREEN_HEIGHT;
 }
 
 function getPreferredBrowserViewportWidth(): string {
-  return IMPORTED_BROWSER_FINGERPRINT_PROFILE.viewport_width || BROWSER_VIEWPORT_WIDTH;
+  return IMPORTED_BROWSER_FINGERPRINT_PROFILE.viewport_width ||
+    BROWSER_VIEWPORT_WIDTH;
 }
 
 function getPreferredBrowserViewportHeight(): string {
-  return IMPORTED_BROWSER_FINGERPRINT_PROFILE.viewport_height || BROWSER_VIEWPORT_HEIGHT;
+  return IMPORTED_BROWSER_FINGERPRINT_PROFILE.viewport_height ||
+    BROWSER_VIEWPORT_HEIGHT;
 }
 
 function getPreferredBrowserColorDepth(): string {
-  return IMPORTED_BROWSER_FINGERPRINT_PROFILE.color_depth || BROWSER_COLOR_DEPTH;
+  return IMPORTED_BROWSER_FINGERPRINT_PROFILE.color_depth ||
+    BROWSER_COLOR_DEPTH;
 }
 
 function getPreferredBrowserPixelRatio(): string {
-  return IMPORTED_BROWSER_FINGERPRINT_PROFILE.pixel_ratio || BROWSER_PIXEL_RATIO;
+  return IMPORTED_BROWSER_FINGERPRINT_PROFILE.pixel_ratio ||
+    BROWSER_PIXEL_RATIO;
 }
 
 function getPreferredBrowserTitle(): string {
@@ -748,8 +896,8 @@ const ANON_TOKEN_ENABLED = true;
 /**
  * 环境变量配置
  */
-const UPSTREAM_API_BASE =
-  Deno.env.get("UPSTREAM_API_BASE") || "https://chat.z.ai";
+const UPSTREAM_API_BASE = Deno.env.get("UPSTREAM_API_BASE") ||
+  "https://chat.z.ai";
 const UPSTREAM_COMPLETION_VERSION =
   (Deno.env.get("UPSTREAM_COMPLETION_VERSION") || "2").trim().toLowerCase();
 const DEFAULT_KEY = Deno.env.get("DEFAULT_KEY") || "sk-your-key";
@@ -786,6 +934,8 @@ interface ModelConfig {
   id: string; // OpenAI API中的模型ID
   name: string; // 显示名称
   upstreamId: string; // Z.ai上游的模型ID
+  providerId?: string;
+  ownedBy?: string;
   capabilities: {
     vision: boolean;
     mcp: boolean;
@@ -797,6 +947,19 @@ interface ModelConfig {
     max_tokens?: number;
   };
 }
+
+const ZAI_PROVIDER_CONFIG: AIProviderConfig = {
+  id: "zai",
+  name: "Z.ai",
+  kind: "zai",
+  enabled: true,
+  baseUrl: UPSTREAM_API_BASE,
+  apiKey: ZAI_TOKEN,
+  models: [],
+  ownedBy: "z.ai",
+  envPrefix: "ZAI",
+  authScheme: "bearer",
+};
 
 const SUPPORTED_MODELS: ModelConfig[] = [
   {
@@ -922,6 +1085,423 @@ const SUPPORTED_MODELS: ModelConfig[] = [
 // 默认模型
 const DEFAULT_MODEL = SUPPORTED_MODELS[0];
 
+function parseBooleanEnv(name: string, defaultValue: boolean): boolean {
+  const raw = Deno.env.get(name);
+  if (raw === undefined || raw.trim() === "") {
+    return defaultValue;
+  }
+  return !["0", "false", "no", "off"].includes(raw.trim().toLowerCase());
+}
+
+const ZAI_FORWARD_SAMPLING_PARAMS = parseBooleanEnv(
+  "ZAI_FORWARD_SAMPLING_PARAMS",
+  false,
+);
+const UPSTREAM_REUSE_FIRST_MESSAGE_CHAT = parseBooleanEnv(
+  "UPSTREAM_REUSE_FIRST_MESSAGE_CHAT",
+  false,
+);
+
+function parseCsvEnv(name: string): string[] {
+  return (Deno.env.get(name) || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function stripTrailingSlash(value: string): string {
+  return value.replace(/\/+$/, "");
+}
+
+function normalizeProviderModelId(modelId: string): string {
+  return modelId.trim().toLowerCase();
+}
+
+function createConfiguredProvider(options: {
+  id: string;
+  name: string;
+  kind: AIProviderKind;
+  envPrefix: string;
+  defaultBaseUrl: string;
+  defaultModels?: string[];
+  defaultEnabled?: boolean;
+  ownedBy?: string;
+  authScheme?: "bearer" | "x-api-key" | "none";
+}): AIProviderConfig | null {
+  const models = parseCsvEnv(`${options.envPrefix}_MODELS`);
+  const apiKey = Deno.env.get(`${options.envPrefix}_API_KEY`) || "";
+  const baseUrl = Deno.env.get(`${options.envPrefix}_BASE_URL`) ||
+    options.defaultBaseUrl;
+  const enabled = parseBooleanEnv(
+    `${options.envPrefix}_ENABLED`,
+    options.defaultEnabled ?? Boolean(apiKey || models.length),
+  );
+
+  if (!enabled) {
+    return null;
+  }
+
+  return {
+    id: options.id,
+    name: options.name,
+    kind: options.kind,
+    enabled,
+    baseUrl: stripTrailingSlash(baseUrl),
+    apiKey,
+    models: models.length ? models : options.defaultModels || [],
+    ownedBy: options.ownedBy || options.id,
+    envPrefix: options.envPrefix,
+    authScheme: options.authScheme ||
+      (options.kind === "anthropic" ? "x-api-key" : "bearer"),
+  };
+}
+
+function getProviderRegistry(): AIProviderConfig[] {
+  const providers: AIProviderConfig[] = [{
+    ...ZAI_PROVIDER_CONFIG,
+    models: SUPPORTED_MODELS.map((model) => model.id),
+  }];
+
+  const openAIProvider = createConfiguredProvider({
+    id: "openai",
+    name: "OpenAI",
+    kind: "openai-compatible",
+    envPrefix: "OPENAI",
+    defaultBaseUrl: "https://api.openai.com/v1",
+    ownedBy: "openai",
+  });
+  if (openAIProvider) providers.push(openAIProvider);
+
+  const anthropicProvider = createConfiguredProvider({
+    id: "anthropic",
+    name: "Anthropic",
+    kind: "anthropic",
+    envPrefix: "ANTHROPIC",
+    defaultBaseUrl: "https://api.anthropic.com/v1",
+    ownedBy: "anthropic",
+    authScheme: "x-api-key",
+  });
+  if (anthropicProvider) providers.push(anthropicProvider);
+
+  const ollamaProvider = createConfiguredProvider({
+    id: "ollama",
+    name: "Ollama",
+    kind: "openai-compatible",
+    envPrefix: "OLLAMA",
+    defaultBaseUrl: "http://127.0.0.1:11434/v1",
+    defaultEnabled: Boolean(
+      Deno.env.get("OLLAMA_BASE_URL") || Deno.env.get("OLLAMA_MODELS"),
+    ),
+    ownedBy: "ollama",
+    authScheme: "none",
+  });
+  if (ollamaProvider) providers.push(ollamaProvider);
+
+  for (const providerId of parseCsvEnv("CUSTOM_PROVIDER_IDS")) {
+    const envPrefix = providerId.toUpperCase().replace(/[^A-Z0-9]+/g, "_");
+    const customProvider = createConfiguredProvider({
+      id: providerId.toLowerCase(),
+      name: Deno.env.get(`${envPrefix}_NAME`) || providerId,
+      kind: "openai-compatible",
+      envPrefix,
+      defaultBaseUrl: Deno.env.get(`${envPrefix}_BASE_URL`) || "",
+      ownedBy: Deno.env.get(`${envPrefix}_OWNED_BY`) || providerId,
+    });
+    if (customProvider?.baseUrl) providers.push(customProvider);
+  }
+
+  return providers;
+}
+
+function findProviderById(providerId: string): AIProviderConfig | undefined {
+  const normalized = providerId.trim().toLowerCase();
+  return getProviderRegistry().find((provider) => provider.id === normalized);
+}
+
+function splitProviderModel(
+  modelId: string,
+): { providerId: string; model: string } | null {
+  const trimmed = modelId.trim();
+  for (const separator of ["/", ":"]) {
+    const index = trimmed.indexOf(separator);
+    if (index > 0) {
+      return {
+        providerId: trimmed.slice(0, index).toLowerCase(),
+        model: trimmed.slice(index + 1),
+      };
+    }
+  }
+  return null;
+}
+
+function resolveAIProvider(modelId: string): AIProviderResolution {
+  const prefixed = splitProviderModel(modelId);
+  if (prefixed) {
+    const provider = findProviderById(prefixed.providerId);
+    if (provider) {
+      return {
+        provider,
+        upstreamModel: prefixed.model,
+        requestedModel: modelId,
+        exposedModelId: `${provider.id}/${prefixed.model}`,
+      };
+    }
+  }
+
+  const normalizedZaiModel = normalizeModelId(modelId);
+  const zaiModel = SUPPORTED_MODELS.find((model) =>
+    model.id === normalizedZaiModel
+  );
+  if (zaiModel) {
+    return {
+      provider: ZAI_PROVIDER_CONFIG,
+      upstreamModel: zaiModel.upstreamId,
+      requestedModel: modelId,
+      exposedModelId: zaiModel.id,
+    };
+  }
+
+  const normalizedModel = normalizeProviderModelId(modelId);
+  for (const provider of getProviderRegistry()) {
+    if (provider.id === "zai") continue;
+    const matched = provider.models.find((candidate) =>
+      normalizeProviderModelId(candidate) === normalizedModel
+    );
+    if (matched) {
+      return {
+        provider,
+        upstreamModel: matched,
+        requestedModel: modelId,
+        exposedModelId: `${provider.id}/${matched}`,
+      };
+    }
+  }
+
+  return {
+    provider: ZAI_PROVIDER_CONFIG,
+    upstreamModel: DEFAULT_MODEL.upstreamId,
+    requestedModel: modelId,
+    exposedModelId: DEFAULT_MODEL.id,
+  };
+}
+
+function listConfiguredModels(): Model[] {
+  const created = Math.floor(Date.now() / 1000);
+  const zaiModels = SUPPORTED_MODELS.map((model) => ({
+    id: model.id,
+    object: "model",
+    created,
+    owned_by: model.ownedBy || ZAI_PROVIDER_CONFIG.ownedBy,
+    display_name: model.name,
+    provider: ZAI_PROVIDER_CONFIG.id,
+  }));
+
+  const providerModels = getProviderRegistry()
+    .filter((provider) => provider.id !== ZAI_PROVIDER_CONFIG.id)
+    .flatMap((provider) =>
+      provider.models.map((model) => ({
+        id: `${provider.id}/${model}`,
+        object: "model",
+        created,
+        owned_by: provider.ownedBy,
+        display_name: `${provider.name} ${model}`,
+        provider: provider.id,
+      }))
+    );
+
+  return [...zaiModels, ...providerModels];
+}
+
+function findConfiguredModel(modelId: string): Model | null {
+  const decodedModelId = decodeURIComponent(modelId || "").trim();
+  if (!decodedModelId) return null;
+  const models = listConfiguredModels();
+  return models.find((model) => model.id === decodedModelId) ||
+    models.find((model) =>
+      normalizeProviderModelId(model.id) ===
+        normalizeProviderModelId(decodedModelId)
+    ) ||
+    null;
+}
+
+function getResponseStoreOwner(request: Request): string {
+  const authHeader = request.headers.get("Authorization") || "";
+  return authHeader.startsWith("Bearer ")
+    ? authHeader.slice(7).trim().slice(0, 96) || "anonymous"
+    : "anonymous";
+}
+
+function cleanupStoredResponses(): void {
+  const now = Date.now();
+  for (const [id, item] of responsesObjectStore.entries()) {
+    if (now - item.updatedAt > RESPONSES_OBJECT_TTL_MS) {
+      responsesObjectStore.delete(id);
+      responsesConversationAliases.delete(id);
+    }
+  }
+}
+
+function cleanupStoredFiles(): void {
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  for (const [id, item] of fileObjectStore.entries()) {
+    if ((nowSeconds - item.created_at) * 1000 > FILE_OBJECT_TTL_MS) {
+      fileObjectStore.delete(id);
+    }
+  }
+}
+
+function storedFileMetadata(file: StoredFileRecord): Record<string, unknown> {
+  return {
+    owner: file.owner,
+    id: file.id,
+    object: file.object,
+    bytes: file.bytes,
+    created_at: file.created_at,
+    filename: file.filename,
+    purpose: file.purpose,
+    contentPath: file.contentPath || fileContentPath(file.id),
+    contentType: file.contentType || "application/octet-stream",
+  };
+}
+
+function publicFilePayload(file: StoredFileRecord): Record<string, unknown> {
+  const { owner: _owner, content: _content, contentBytes: _bytes, ...payload } =
+    file;
+  return payload;
+}
+
+function fileMetadataPath(fileId: string): string {
+  return `${FILE_STORAGE_DIR}/${fileId}.json`;
+}
+
+function fileContentPath(fileId: string): string {
+  return `${FILE_STORAGE_DIR}/${fileId}.bin`;
+}
+
+async function ensureFileStorageLoaded(): Promise<void> {
+  if (fileStoreLoaded) return;
+  fileStoreLoaded = true;
+  try {
+    await Deno.mkdir(FILE_STORAGE_DIR, { recursive: true });
+  } catch (error) {
+    debugLog("Files 持久化目录初始化失败: %s", String(error));
+    return;
+  }
+
+  // Avoid Deno.readDir typing requirements by using `ls`; this keeps the
+  // compatibility layer working in older Deno runtime declarations too.
+  try {
+    const command = new Deno.Command("sh", {
+      args: ["-c", "ls -1 -- *.json 2>/dev/null || true"],
+      cwd: FILE_STORAGE_DIR,
+      stdout: "piped",
+      stderr: "piped",
+    });
+    const child = command.spawn();
+    const [status, output] = await Promise.all([
+      child.status,
+      child.stdout.getReader().read(),
+    ]);
+    if (!status.success || !output.value) return;
+    const files = new TextDecoder().decode(output.value).split(/\r?\n/)
+      .map((item) => item.trim()).filter(Boolean);
+    for (const fileName of files) {
+      if (!/^[a-zA-Z0-9_-]+\.json$/.test(fileName)) continue;
+      try {
+        const metadata = JSON.parse(
+          await Deno.readTextFile(`${FILE_STORAGE_DIR}/${fileName}`),
+        ) as Record<string, any>;
+        if (
+          typeof metadata.id !== "string" || !metadata.id.startsWith("file_")
+        ) {
+          continue;
+        }
+        const contentPath = typeof metadata.contentPath === "string"
+          ? metadata.contentPath
+          : fileContentPath(metadata.id);
+        fileObjectStore.set(metadata.id, {
+          owner: String(metadata.owner || "anonymous"),
+          id: metadata.id,
+          object: "file",
+          bytes: Number(metadata.bytes || 0),
+          created_at: Number(
+            metadata.created_at || Math.floor(Date.now() / 1000),
+          ),
+          filename: String(metadata.filename || "upload"),
+          purpose: String(metadata.purpose || "assistants"),
+          contentPath,
+          contentType: String(
+            metadata.contentType || "application/octet-stream",
+          ),
+        });
+      } catch (error) {
+        debugLog(
+          "跳过损坏的 Files metadata: %s error=%s",
+          fileName,
+          String(error),
+        );
+      }
+    }
+  } catch (error) {
+    debugLog("Files 持久化 metadata 加载失败: %s", String(error));
+  }
+}
+
+async function savePersistentFile(file: StoredFileRecord): Promise<void> {
+  await Deno.mkdir(FILE_STORAGE_DIR, { recursive: true });
+  const contentPath = file.contentPath || fileContentPath(file.id);
+  if (file.contentBytes) {
+    await Deno.writeFile(contentPath, file.contentBytes);
+  } else if (typeof file.content === "string") {
+    await Deno.writeFile(contentPath, new TextEncoder().encode(file.content));
+  }
+  file.contentPath = contentPath;
+  await Deno.writeTextFile(
+    fileMetadataPath(file.id),
+    JSON.stringify(storedFileMetadata(file), null, 2),
+  );
+}
+
+async function readStoredFileBytes(
+  file: StoredFileRecord,
+): Promise<Uint8Array> {
+  if (file.contentBytes) return file.contentBytes;
+  if (typeof file.content === "string") {
+    return new TextEncoder().encode(file.content);
+  }
+  if (file.contentPath) return await Deno.readFile(file.contentPath);
+  return new Uint8Array();
+}
+
+async function deletePersistentFile(fileId: string): Promise<void> {
+  await Promise.all([
+    Deno.remove(fileMetadataPath(fileId)).catch(() => undefined),
+    Deno.remove(fileContentPath(fileId)).catch(() => undefined),
+  ]);
+}
+
+function storeResponseObject(
+  request: Request,
+  payload: Record<string, unknown>,
+): void {
+  const id = typeof payload.id === "string" ? payload.id : "";
+  if (!id) return;
+  cleanupStoredResponses();
+  responsesObjectStore.set(id, {
+    owner: getResponseStoreOwner(request),
+    payload,
+    updatedAt: Date.now(),
+  });
+}
+
+function buildOpenAIError(
+  message: string,
+  type = "invalid_request_error",
+  code?: string,
+): string {
+  return JSON.stringify({ error: { message, type, code: code || null } });
+}
+
 // 根据模型ID获取配置
 function getModelConfig(modelId: string): ModelConfig {
   // 标准化模型ID，处理Cherry Studio等客户端的大小写差异
@@ -933,11 +1513,42 @@ function getModelConfig(modelId: string): ModelConfig {
       "⚠️ 未找到模型配置: %s (标准化后: %s)，使用默认模型: %s",
       modelId,
       normalizedModelId,
-      DEFAULT_MODEL.name
+      DEFAULT_MODEL.name,
     );
   }
 
   return found || DEFAULT_MODEL;
+}
+
+function buildUpstreamParams(
+  req: OpenAIRequest,
+  modelConfig: ModelConfig,
+): Record<string, unknown> {
+  const params: Record<string, unknown> = {};
+  if (!ZAI_FORWARD_SAMPLING_PARAMS) {
+    if (
+      typeof req.temperature === "number" ||
+      typeof req.top_p === "number" ||
+      typeof req.max_tokens === "number"
+    ) {
+      debugLog(
+        "Z.ai 上游默认使用浏览器兼容 params={}，已忽略客户端采样参数；如需转发请设置 ZAI_FORWARD_SAMPLING_PARAMS=true",
+      );
+    }
+    return params;
+  }
+
+  Object.assign(params, modelConfig.defaultParams);
+  if (typeof req.temperature === "number" && Number.isFinite(req.temperature)) {
+    params.temperature = req.temperature;
+  }
+  if (typeof req.top_p === "number" && Number.isFinite(req.top_p)) {
+    params.top_p = req.top_p;
+  }
+  if (typeof req.max_tokens === "number" && Number.isFinite(req.max_tokens)) {
+    params.max_tokens = Math.max(1, Math.floor(req.max_tokens));
+  }
+  return params;
 }
 
 /**
@@ -981,22 +1592,756 @@ function normalizeModelId(modelId: string): string {
   return normalized;
 }
 
+function messageContentToZaiText(content: Message["content"]): string {
+  if (content === null) {
+    return "";
+  }
+
+  if (typeof content === "string") {
+    return content;
+  }
+
+  return content.map((block) => {
+    if (block.type === "text") return block.text || "";
+    if (block.type === "image_url") {
+      return `[image: ${block.image_url?.url || ""}]`;
+    }
+    if (block.type === "video_url") {
+      return `[video: ${block.video_url?.url || ""}]`;
+    }
+    if (block.type === "document_url") {
+      return `[document: ${block.document_url?.url || ""}]`;
+    }
+    if (block.type === "audio_url") {
+      return `[audio: ${block.audio_url?.url || ""}]`;
+    }
+    return "";
+  }).filter(Boolean).join("\n");
+}
+
+function serializeToolCallsForZai(toolCalls?: ToolCall[]): string {
+  if (!toolCalls?.length) {
+    return "";
+  }
+
+  return toolCalls.map((toolCall) =>
+    `- ${toolCall.function.name}(${toolCall.function.arguments || "{}"})`
+  ).join("\n");
+}
+
+function normalizeRoleForZai(role: string): string {
+  if (role === "system" || role === "user" || role === "assistant") {
+    return role;
+  }
+  if (role === "developer") {
+    return "system";
+  }
+  return "user";
+}
+
+function sanitizeMessageForZai(message: Message): Message {
+  const role = normalizeRoleForZai(message.role);
+
+  if (message.role === "tool") {
+    const toolName = message.name || message.tool_call_id || "unknown";
+    return {
+      role: "user",
+      content: `Tool result (${toolName}):\n${
+        messageContentToZaiText(message.content)
+      }`,
+    };
+  }
+
+  if (message.tool_calls?.length) {
+    const text = messageContentToZaiText(message.content);
+    const toolCallText = serializeToolCallsForZai(message.tool_calls);
+    return {
+      role,
+      content: [
+        text,
+        toolCallText ? `Assistant requested tool calls:\n${toolCallText}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n\n"),
+    };
+  }
+
+  if (message.content === null) {
+    return { role, content: "" };
+  }
+
+  if (role !== message.role) {
+    return { role, content: messageContentToZaiText(message.content) };
+  }
+
+  return { role, content: message.content };
+}
+
+function shouldUseZaiToolCallBridge(req: OpenAIRequest): boolean {
+  return ZAI_TOOL_CALL_BRIDGE && Boolean(req.tools?.length) &&
+    req.tool_choice !== "none";
+}
+
+function stringifyToolSchema(tool: Tool): string {
+  try {
+    return JSON.stringify({
+      name: tool.function.name,
+      description: tool.function.description || "",
+      parameters: tool.function.parameters || {},
+    });
+  } catch {
+    return JSON.stringify({ name: tool.function.name });
+  }
+}
+
+function buildZaiToolCallBridgeInstruction(req: OpenAIRequest): string {
+  const tools = (req.tools || []).map(stringifyToolSchema).join("\n");
+  const forcedTool = typeof req.tool_choice === "object"
+    ? req.tool_choice.function.name
+    : "";
+  const choiceRule = forcedTool
+    ? `You MUST call the tool named ${forcedTool}.`
+    : "You decide whether to call tools. If the task requires files, commands, MCP resources, project state, or any external/local data, call the most appropriate tool. After tool results arrive, decide the next tool or final answer yourself.";
+
+  return [
+    "You are the planning brain behind an OpenAI-compatible tool-call bridge for an agentic coding client.",
+    choiceRule,
+    "Plan dynamically from the conversation and tool results; do not follow a fixed canned sequence.",
+    "You may call tools across multiple turns. When enough evidence is available, provide the final answer instead of calling another tool.",
+    "Never claim that you inspected files, directories, commands, MCP resources, or the current project unless a tool result was provided in this conversation.",
+    "When a tool is needed, output ONLY one tool-call payload and no markdown/prose/explanation.",
+    "Preferred DSML/XML shape:",
+    '<tool_calls><invoke name="tool_name"><parameter name="arg">value</parameter></invoke></tool_calls>',
+    "Alternative JSON shape:",
+    '{"tool_calls":[{"name":"tool_name","arguments":{}}]}',
+    "Do not stream partial natural-language text before a tool call. If unsure, call a safe inspection/search tool first.",
+    "Available tools:",
+    tools,
+  ].join("\n");
+}
+
+function injectZaiToolCallBridgeInstruction(
+  messages: Message[],
+  req: OpenAIRequest,
+): Message[] {
+  if (!shouldUseZaiToolCallBridge(req)) {
+    return messages;
+  }
+  return [{
+    role: "system",
+    content: buildZaiToolCallBridgeInstruction(req),
+  }, ...messages];
+}
+
+function tryParseToolCallJson(rawContent: string): Record<string, any> | null {
+  const candidates: string[] = [];
+  const trimmed = rawContent.trim();
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced?.[1]) {
+    candidates.push(fenced[1].trim());
+  }
+  candidates.push(trimmed);
+  const firstBrace = trimmed.indexOf("{");
+  const lastBrace = trimmed.lastIndexOf("}");
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    candidates.push(trimmed.slice(firstBrace, lastBrace + 1));
+  }
+
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, any>;
+      }
+    } catch {
+      // Try the next candidate.
+    }
+  }
+  return null;
+}
+
+function decodeMarkupEntities(value: string): string {
+  return value
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+}
+
+function readMarkupAttribute(attrs: string, name: string): string {
+  const quoted = attrs.match(new RegExp(`${name}\\s*=\\s*(["'])(.*?)\\1`, "i"));
+  if (quoted?.[2]) return decodeMarkupEntities(quoted[2].trim());
+  const bare = attrs.match(new RegExp(`${name}\\s*=\\s*([^\\s>]+)`, "i"));
+  return bare?.[1] ? decodeMarkupEntities(bare[1].trim()) : "";
+}
+
+function parseMarkupParameterValue(rawValue: string): unknown {
+  const value = decodeMarkupEntities(rawValue.trim());
+  if (!value) return "";
+  if (
+    (value.startsWith("{") && value.endsWith("}")) ||
+    (value.startsWith("[") && value.endsWith("]")) ||
+    /^(true|false|null|-?\d+(?:\.\d+)?)$/i.test(value)
+  ) {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return value;
+    }
+  }
+  return value;
+}
+
+function normalizeToolMarkup(content: string): string {
+  return content
+    .replace(/<\|\s*DSML\s*\|\s*tool_calls\s*>/gi, "<tool_calls>")
+    .replace(/<\|\s*\/\s*DSML\s*\|\s*tool_calls\s*>/gi, "</tool_calls>")
+    .replace(/<\|\s*tool_calls\s*>/gi, "<tool_calls>")
+    .replace(/<\|\s*\/\s*tool_calls\s*>/gi, "</tool_calls>")
+    .replace(/<\|\s*DSML\s*\|\s*invoke\b/gi, "<invoke")
+    .replace(/<\|\s*\/\s*DSML\s*\|\s*invoke\s*>/gi, "</invoke>")
+    .replace(/<\|\s*invoke\b/gi, "<invoke")
+    .replace(/<\|\s*\/\s*invoke\s*>/gi, "</invoke>")
+    .replace(/<\|\s*DSML\s*\|\s*parameter\b/gi, "<parameter")
+    .replace(/<\|\s*\/\s*DSML\s*\|\s*parameter\s*>/gi, "</parameter>")
+    .replace(/<\|\s*parameter\b/gi, "<parameter")
+    .replace(/<\|\s*\/\s*parameter\s*>/gi, "</parameter>")
+    .replace(/＜/g, "<")
+    .replace(/＞/g, ">");
+}
+
+function extractZaiMarkupToolCalls(
+  content: string,
+  tools?: Tool[],
+): ToolCall[] {
+  const normalized = normalizeToolMarkup(content);
+  if (!/<(?:tool_calls|invoke|parameter)\b/i.test(normalized)) {
+    return [];
+  }
+  const allowedTools = new Set((tools || []).map((tool) => tool.function.name));
+  const calls: ToolCall[] = [];
+  const invokeRegex = /<invoke\b([^>]*)>([\s\S]*?)<\/invoke>/gi;
+  let invokeMatch: RegExpExecArray | null;
+  while ((invokeMatch = invokeRegex.exec(normalized)) !== null) {
+    const attrs = invokeMatch[1] || "";
+    const body = invokeMatch[2] || "";
+    const name = readMarkupAttribute(attrs, "name") ||
+      readMarkupAttribute(attrs, "tool") ||
+      readMarkupAttribute(attrs, "function");
+    if (!name || (allowedTools.size > 0 && !allowedTools.has(name))) {
+      continue;
+    }
+
+    const args: Record<string, unknown> = {};
+    const parameterRegex = /<parameter\b([^>]*)>([\s\S]*?)<\/parameter>/gi;
+    let parameterMatch: RegExpExecArray | null;
+    while ((parameterMatch = parameterRegex.exec(body)) !== null) {
+      const parameterName = readMarkupAttribute(
+        parameterMatch[1] || "",
+        "name",
+      );
+      if (!parameterName) continue;
+      args[parameterName] = parseMarkupParameterValue(parameterMatch[2] || "");
+    }
+
+    const argumentsText = Object.keys(args).length
+      ? JSON.stringify(args)
+      : toolArgumentsToString(parseMarkupParameterValue(body));
+    calls.push({
+      id: createToolCallId(),
+      type: "function",
+      function: { name, arguments: argumentsText },
+    });
+  }
+  return calls;
+}
+
+function toolArgumentsToString(value: unknown): string {
+  if (typeof value === "string") {
+    return value.trim() || "{}";
+  }
+  try {
+    return JSON.stringify(value ?? {});
+  } catch {
+    return "{}";
+  }
+}
+
+function createToolCallId(): string {
+  return `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
+}
+
+function extractZaiBridgeToolCalls(
+  content: string,
+  tools?: Tool[],
+): ToolCall[] {
+  const markupCalls = extractZaiMarkupToolCalls(content, tools);
+  if (markupCalls.length > 0) {
+    return markupCalls;
+  }
+
+  const parsed = tryParseToolCallJson(content);
+  if (!parsed) {
+    return [];
+  }
+
+  const rawCalls = Array.isArray(parsed.tool_calls)
+    ? parsed.tool_calls
+    : parsed.name || parsed.function || parsed.tool_name
+    ? [parsed]
+    : [];
+  if (!rawCalls.length) {
+    return [];
+  }
+
+  const allowedTools = new Set((tools || []).map((tool) => tool.function.name));
+  const calls: ToolCall[] = [];
+  for (const rawCall of rawCalls) {
+    if (!rawCall || typeof rawCall !== "object") continue;
+    const record = rawCall as Record<string, any>;
+    const fnRecord = record.function && typeof record.function === "object"
+      ? record.function as Record<string, any>
+      : null;
+    const name = String(
+      record.name || record.tool_name || fnRecord?.name || "",
+    ).trim();
+    if (!name || (allowedTools.size > 0 && !allowedTools.has(name))) {
+      continue;
+    }
+    const args = record.arguments ?? record.args ?? record.input ??
+      fnRecord?.arguments ?? {};
+    calls.push({
+      id: String(record.id || createToolCallId()),
+      type: "function",
+      function: {
+        name,
+        arguments: toolArgumentsToString(args),
+      },
+    });
+  }
+  return calls;
+}
+
+function fillFallbackArgumentBySchema(schema: Record<string, any>): unknown {
+  if (schema.default !== undefined) return schema.default;
+  if (Array.isArray(schema.enum) && schema.enum.length > 0) {
+    return schema.enum[0];
+  }
+  if (schema.type === "boolean") return false;
+  if (schema.type === "number" || schema.type === "integer") return 0;
+  if (schema.type === "array") return [];
+  if (schema.type === "object") return {};
+  return "";
+}
+
+function buildFallbackArgumentsForTool(
+  tool: Tool,
+  purpose = "initial-inspection",
+): Record<string, unknown> {
+  const params = tool.function.parameters || {};
+  const properties = params.properties && typeof params.properties === "object"
+    ? params.properties as Record<string, any>
+    : {};
+  const args: Record<string, unknown> = {};
+  const toolName = tool.function.name.toLowerCase();
+  const defectSearchPattern =
+    "TODO|FIXME|throw new Error|catch \\(|eval\\(|Deno\\.env\\.get|captcha|tool_calls|INTERNAL_ERROR|any";
+
+  if (/^read|read.*file|open.*file/i.test(toolName)) {
+    if ("path" in properties) {
+      args.path = purpose === "read-docs" ? "README.md" : "main.ts";
+    }
+    if ("file" in properties) {
+      args.file = purpose === "read-docs" ? "README.md" : "main.ts";
+    }
+    if ("file_path" in properties) {
+      args.file_path = purpose === "read-docs" ? "README.md" : "main.ts";
+    }
+  } else if ("path" in properties) args.path = ".";
+  if ("cwd" in properties) args.cwd = ".";
+  if ("recursive" in properties) args.recursive = true;
+  if ("pattern" in properties) {
+    args.pattern = /(grep|search|rg)/i.test(toolName)
+      ? defectSearchPattern
+      : "**/*";
+  }
+  if ("regex" in properties) args.regex = defectSearchPattern;
+  if ("query" in properties) {
+    args.query = purpose === "grep-defects"
+      ? "find defects, TODO, unsafe error handling, tool calling, captcha and context bugs"
+      : "project structure and defects";
+  }
+  if ("command" in properties) {
+    args.command = purpose === "grep-defects"
+      ? "rg -n \"TODO|FIXME|throw new Error|catch \\\\(|eval\\\\(|Deno\\\\.env\\\\.get|captcha|tool_calls|INTERNAL_ERROR|any\" -g '!node_modules' -g '!dist' -g '!coverage' . | sed -n '1,240p'"
+      : "pwd && ls -la && rg --files -g '!node_modules' -g '!dist' -g '!coverage' | sed -n '1,200p'";
+  }
+  if ("cmd" in properties) {
+    args.cmd = purpose === "grep-defects"
+      ? "rg -n \"TODO|FIXME|throw new Error|catch \\\\(|eval\\\\(|Deno\\\\.env\\\\.get|captcha|tool_calls|INTERNAL_ERROR|any\" -g '!node_modules' -g '!dist' -g '!coverage' . | sed -n '1,240p'"
+      : "pwd && ls -la && rg --files -g '!node_modules' -g '!dist' -g '!coverage' | sed -n '1,200p'";
+  }
+  if (
+    !Object.keys(args).length &&
+    /^(bash|shell|terminal|command)$/i.test(toolName)
+  ) {
+    args.command = purpose === "grep-defects"
+      ? "rg -n \"TODO|FIXME|throw new Error|catch \\\\(|eval\\\\(|Deno\\\\.env\\\\.get|captcha|tool_calls|INTERNAL_ERROR|any\" -g '!node_modules' -g '!dist' -g '!coverage' . | sed -n '1,240p'"
+      : "pwd && ls -la && rg --files -g '!node_modules' -g '!dist' -g '!coverage' | sed -n '1,200p'";
+  }
+
+  const required = Array.isArray(params.required) ? params.required : [];
+  for (const key of required) {
+    if (typeof key !== "string" || args[key] !== undefined) continue;
+    const schema = properties[key] && typeof properties[key] === "object"
+      ? properties[key] as Record<string, any>
+      : {};
+    args[key] = fillFallbackArgumentBySchema(schema);
+  }
+  return args;
+}
+
+function hasOpenAIToolResult(messages: Message[]): boolean {
+  return messages.some((message) =>
+    message.role === "tool" || Boolean(message.tool_call_id)
+  );
+}
+
+function getAssistantToolCallNames(messages: Message[]): Set<string> {
+  const names = new Set<string>();
+  for (const message of messages) {
+    for (const toolCall of message.tool_calls || []) {
+      if (toolCall.function?.name) names.add(toolCall.function.name);
+    }
+  }
+  return names;
+}
+
+function countAssistantToolCalls(messages: Message[]): number {
+  return messages.reduce(
+    (sum, message) => sum + (message.tool_calls?.length || 0),
+    0,
+  );
+}
+
+function getLastUserText(messages: Message[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user") {
+      return messageContentToZaiText(messages[i].content);
+    }
+  }
+  return "";
+}
+
+function isProjectInspectionRequest(text: string): boolean {
+  const normalized = text.toLowerCase();
+  return /\b(project|workspace|repo|repository|codebase|directory|directories|file|files|folder|folders|structure|tree|list|read|inspect|analy[sz]e|search|grep|glob|mcp)\b/i
+    .test(normalized) ||
+    /(当前项目|项目|工作区|仓库|代码库|目录|文件|结构|树|列出|读取|分析|检查|搜索|查看|浏览|工具|调用)/
+      .test(text);
+}
+
+function shouldFallbackToZaiToolCall(req: OpenAIRequest): boolean {
+  if (!req.tools?.length || req.tool_choice === "none") {
+    return false;
+  }
+  if (!ZAI_TOOL_CALL_BRIDGE_AUTO_FALLBACK) {
+    // Default mode is model-planned agent behavior. Only synthesize a fallback
+    // when the client explicitly forced tool use; otherwise let the model decide.
+    return typeof req.tool_choice === "object" ||
+      req.tool_choice === "required";
+  }
+  const localInspectionRequest = isProjectInspectionRequest(
+    getLastUserText(req.messages),
+  );
+  if (typeof req.tool_choice === "object") {
+    return true;
+  }
+  if (req.tool_choice === "required") {
+    return true;
+  }
+  if (hasOpenAIToolResult(req.messages)) {
+    // Coding clients call us repeatedly after each tool result. Keep driving a
+    // short inspection loop instead of stopping after the first `bash` result.
+    return localInspectionRequest && countAssistantToolCalls(req.messages) < 3;
+  }
+  return localInspectionRequest;
+}
+
+function buildZaiFallbackToolCalls(req: OpenAIRequest): ToolCall[] {
+  if (!shouldFallbackToZaiToolCall(req)) {
+    return [];
+  }
+  const tools = req.tools || [];
+  const forcedToolName = typeof req.tool_choice === "object"
+    ? req.tool_choice.function.name
+    : "";
+  const localInspectionRequest = isProjectInspectionRequest(
+    getLastUserText(req.messages),
+  );
+  const calledToolNames = getAssistantToolCallNames(req.messages);
+  const findTool = (patterns: RegExp[]) =>
+    tools.find((tool) =>
+      !calledToolNames.has(tool.function.name) &&
+      patterns.some((pattern) => pattern.test(tool.function.name))
+    );
+  let purpose = "initial-inspection";
+  const preferred =
+    (forcedToolName
+      ? tools.find((tool) => tool.function.name === forcedToolName)
+      : undefined) ||
+    (localInspectionRequest && hasOpenAIToolResult(req.messages)
+      ? (() => {
+        const grepTool = findTool([/(grep|rg|search)/i]);
+        if (grepTool) {
+          purpose = "grep-defects";
+          return grepTool;
+        }
+        const readTool = findTool([/^read/i, /read.*file/i]);
+        if (readTool) {
+          purpose = "read-main";
+          return readTool;
+        }
+        const globTool = findTool([/glob/i, /list.*(file|dir)/i]);
+        if (globTool) {
+          purpose = "initial-inspection";
+          return globTool;
+        }
+        return undefined;
+      })()
+      : undefined) ||
+    (localInspectionRequest
+      ? tools.find((tool) =>
+        /^(bash|shell|terminal|command)$/i.test(tool.function.name)
+      )
+      : undefined) ||
+    tools.find((tool) =>
+      /^(list_files|list_directory|list_dir)$/i.test(tool.function.name)
+    ) ||
+    tools.find((tool) => /list.*(file|dir)/i.test(tool.function.name)) ||
+    tools.find((tool) =>
+      /(search|glob|grep|rg).*file/i.test(tool.function.name)
+    ) ||
+    tools.find((tool) => /read.*file/i.test(tool.function.name));
+  if (!preferred) {
+    return [];
+  }
+  return [{
+    id: createToolCallId(),
+    type: "function",
+    function: {
+      name: preferred.function.name,
+      arguments: JSON.stringify(
+        buildFallbackArgumentsForTool(preferred, purpose),
+      ),
+    },
+  }];
+}
+
+function buildZaiBridgeToolCallResponseMessage(
+  content: string,
+  req: OpenAIRequest,
+): Message | null {
+  const toolCalls = extractZaiBridgeToolCalls(content, req.tools);
+  if (toolCalls.length > 0) {
+    return { role: "assistant", content: null, tool_calls: toolCalls };
+  }
+
+  const fallbackToolCalls = buildZaiFallbackToolCalls(req);
+  if (fallbackToolCalls.length > 0) {
+    debugLog(
+      "🔧 Z.ai tool bridge 未解析到工具 JSON，已回退为安全探测工具调用: %s",
+      fallbackToolCalls.map((call) => call.function.name).join(", "),
+    );
+    return { role: "assistant", content: null, tool_calls: fallbackToolCalls };
+  }
+
+  return null;
+}
+
+function buildZaiDirectToolCallMessage(req: OpenAIRequest): Message | null {
+  const toolCalls = buildZaiFallbackToolCalls(req);
+  if (!toolCalls.length) {
+    return null;
+  }
+  return { role: "assistant", content: null, tool_calls: toolCalls };
+}
+
+function createZaiDirectToolCallResponse(
+  req: OpenAIRequest,
+  message: Message,
+  baseHeaders: Headers,
+): Response {
+  const headers = new Headers(baseHeaders);
+  if (req.stream === true) {
+    headers.set("Content-Type", "text/event-stream");
+    headers.set("Cache-Control", "no-cache");
+    headers.set("Connection", "keep-alive");
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const send = (payload: OpenAIResponse) => {
+          controller.enqueue(
+            encoder.encode(`data: ${JSON.stringify(payload)}\n\n`),
+          );
+        };
+        const created = Math.floor(Date.now() / 1000);
+        const id = `chatcmpl-${Date.now()}`;
+        send({
+          id,
+          object: "chat.completion.chunk",
+          created,
+          model: req.model,
+          choices: [{ index: 0, delta: { role: "assistant" } }],
+        });
+        send({
+          id,
+          object: "chat.completion.chunk",
+          created,
+          model: req.model,
+          choices: [{
+            index: 0,
+            delta: {
+              tool_calls: (message.tool_calls || []).map((toolCall, index) => ({
+                index,
+                id: toolCall.id,
+                type: "function" as const,
+                function: {
+                  name: toolCall.function.name,
+                  arguments: toolCall.function.arguments,
+                },
+              })),
+            },
+          }],
+        });
+        send({
+          id,
+          object: "chat.completion.chunk",
+          created,
+          model: req.model,
+          choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+        });
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      },
+    });
+    return new Response(stream, { status: 200, headers });
+  }
+
+  headers.set("Content-Type", "application/json");
+  return new Response(
+    JSON.stringify({
+      id: `chatcmpl-${Date.now()}`,
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: req.model,
+      choices: [{ index: 0, message, finish_reason: "tool_calls" }],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    }),
+    { status: 200, headers },
+  );
+}
+
+function createToolCallChatCompletion(
+  req: OpenAIRequest,
+  message: Message,
+): OpenAIResponse {
+  return {
+    id: `chatcmpl-${Date.now()}`,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: req.model,
+    choices: [{
+      index: 0,
+      message,
+      finish_reason: "tool_calls",
+    }],
+    usage: {
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      total_tokens: 0,
+    },
+  };
+}
+
+function createToolCallStreamResponse(
+  req: OpenAIRequest,
+  message: Message,
+  headers: Headers,
+): Response {
+  const encoder = new TextEncoder();
+  const id = `chatcmpl-${Date.now()}`;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(
+        encoder.encode(openAIStreamChunk(id, req.model, { role: "assistant" })),
+      );
+      if (message.tool_calls?.length) {
+        controller.enqueue(encoder.encode(openAIStreamChunk(id, req.model, {
+          tool_calls: message.tool_calls.map((toolCall, index) => ({
+            index,
+            id: toolCall.id,
+            type: "function" as const,
+            function: {
+              name: toolCall.function.name,
+              arguments: toolCall.function.arguments,
+            },
+          })),
+        })));
+      }
+      controller.enqueue(
+        encoder.encode(openAIStreamChunk(id, req.model, {}, "tool_calls")),
+      );
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      controller.close();
+    },
+  });
+
+  headers.set("Content-Type", "text/event-stream");
+  headers.set("Cache-Control", "no-cache");
+  headers.set("Connection", "keep-alive");
+  return new Response(stream, { status: 200, headers });
+}
+
+function createToolCallResponse(
+  req: OpenAIRequest,
+  message: Message,
+  headers: Headers,
+): Response {
+  if (req.stream === true) {
+    return createToolCallStreamResponse(req, message, headers);
+  }
+  headers.set("Content-Type", "application/json");
+  return new Response(
+    JSON.stringify(createToolCallChatCompletion(req, message)),
+    {
+      status: 200,
+      headers,
+    },
+  );
+}
+
 /**
  * 处理和验证全方位多模态消息
  * 支持图像、视频、文档、音频等多种媒体类型
  */
 function processMessages(
   messages: Message[],
-  modelConfig: ModelConfig
+  modelConfig: ModelConfig,
 ): Message[] {
   const processedMessages: Message[] = [];
 
   for (const message of messages) {
-    const processedMessage: Message = { ...message };
+    const sanitizedMessage = sanitizeMessageForZai(message);
+    const processedMessage: Message = { ...sanitizedMessage };
 
     // 检查是否为多模态消息
-    if (Array.isArray(message.content)) {
-      debugLog("检测到多模态消息，内容块数量: %d", message.content.length);
+    if (Array.isArray(sanitizedMessage.content)) {
+      debugLog(
+        "检测到多模态消息，内容块数量: %d",
+        sanitizedMessage.content.length,
+      );
 
       // 统计各种媒体类型
       const mediaStats = {
@@ -1012,17 +2357,17 @@ function processMessages(
       if (!modelConfig.capabilities.vision) {
         debugLog(
           "警告: 模型 %s 不支持多模态，但收到了多模态消息",
-          modelConfig.name
+          modelConfig.name,
         );
         // 只保留文本内容
-        const textContent = message.content
+        const textContent = sanitizedMessage.content
           .filter((block) => block.type === "text")
           .map((block) => block.text)
           .join("\n");
         processedMessage.content = textContent;
       } else {
         // GLM-4.5V 支持全方位多模态，处理所有内容类型
-        for (const block of message.content) {
+        for (const block of sanitizedMessage.content) {
           switch (block.type) {
             case "text":
               if (block.text) {
@@ -1041,7 +2386,7 @@ function processMessages(
                   debugLog(
                     "🖼️ 图像数据: %s格式, 大小: %d字符",
                     format,
-                    url.length
+                    url.length,
                   );
                 } else if (url.startsWith("http")) {
                   debugLog("🔗 图像URL: %s", url);
@@ -1061,7 +2406,7 @@ function processMessages(
                   debugLog(
                     "🎥 视频数据: %s格式, 大小: %d字符",
                     format,
-                    url.length
+                    url.length,
                   );
                 } else if (url.startsWith("http")) {
                   debugLog("🔗 视频URL: %s", url);
@@ -1081,7 +2426,7 @@ function processMessages(
                   debugLog(
                     "📄 文档数据: %s格式, 大小: %d字符",
                     format,
-                    url.length
+                    url.length,
                   );
                 } else if (url.startsWith("http")) {
                   debugLog("🔗 文档URL: %s", url);
@@ -1101,7 +2446,7 @@ function processMessages(
                   debugLog(
                     "🎵 音频数据: %s格式, 大小: %d字符",
                     format,
-                    url.length
+                    url.length,
                   );
                 } else if (url.startsWith("http")) {
                   debugLog("🔗 音频URL: %s", url);
@@ -1118,8 +2463,7 @@ function processMessages(
         }
 
         // 输出统计信息
-        const totalMedia =
-          mediaStats.images +
+        const totalMedia = mediaStats.images +
           mediaStats.videos +
           mediaStats.documents +
           mediaStats.audios;
@@ -1130,12 +2474,12 @@ function processMessages(
             mediaStats.images,
             mediaStats.videos,
             mediaStats.documents,
-            mediaStats.audios
+            mediaStats.audios,
           );
         }
       }
-    } else if (typeof message.content === "string") {
-      debugLog("📝 纯文本消息，长度: %d", message.content.length);
+    } else if (typeof sanitizedMessage.content === "string") {
+      debugLog("📝 纯文本消息，长度: %d", sanitizedMessage.content.length);
     }
 
     processedMessages.push(processedMessage);
@@ -1149,28 +2493,63 @@ const DEFAULT_STREAM = Deno.env.get("DEFAULT_STREAM") !== "false"; // 默认为t
 const DASHBOARD_ENABLED = Deno.env.get("DASHBOARD_ENABLED") !== "false"; // 默认为true
 const UPSTREAM_TRANSPORT_PREFERENCE =
   (Deno.env.get("UPSTREAM_TRANSPORT_PREFERENCE") || "auto").toLowerCase();
+const UPSTREAM_AUTO_PREFER_CURL_ON_RESOLVE =
+  Deno.env.get("UPSTREAM_AUTO_PREFER_CURL_ON_RESOLVE") === "true";
 const UPSTREAM_HOST_RESOLVE_OVERRIDES =
   (Deno.env.get("UPSTREAM_HOST_RESOLVE_OVERRIDES") || "").trim();
 const UPSTREAM_IMPERSONATE_BROWSER =
   (Deno.env.get("UPSTREAM_IMPERSONATE_BROWSER") || "chrome136").trim();
 const UPSTREAM_PROXY_URL = Deno.env.get("UPSTREAM_PROXY_URL") || "";
-const UPSTREAM_SYSTEM_PROXY_AUTO_DETECT =
-  Deno.env.get("UPSTREAM_SYSTEM_PROXY_AUTO_DETECT") !== "false";
+const UPSTREAM_COMPACT_REUSE_RECENT_CHAT =
+  Deno.env.get("UPSTREAM_COMPACT_REUSE_RECENT_CHAT") === "true";
+const UPSTREAM_REUSE_FULL_HISTORY_CHAT =
+  Deno.env.get("UPSTREAM_REUSE_FULL_HISTORY_CHAT") === "true";
+const UPSTREAM_COMPACT_REUSE_LOCAL_HISTORY =
+  Deno.env.get("UPSTREAM_COMPACT_REUSE_LOCAL_HISTORY") === "true";
+const ZAI_FORWARD_OPENAI_TOOLS =
+  Deno.env.get("ZAI_FORWARD_OPENAI_TOOLS") === "true";
+const ZAI_TOOL_CALL_BRIDGE = Deno.env.get("ZAI_TOOL_CALL_BRIDGE") !== "false";
+const ZAI_TOOL_CALL_BRIDGE_AUTO_FALLBACK =
+  Deno.env.get("ZAI_TOOL_CALL_BRIDGE_AUTO_FALLBACK") !== "false";
+const UPSTREAM_EXPLICIT_CONVERSATION_HEADER = "x-ztoapi-conversation-id";
+const UPSTREAM_SESSION_KEY_SECRET =
+  (Deno.env.get("UPSTREAM_SESSION_KEY_SECRET") || "ztoapi-session-v2").trim();
 const AUTO_CAPTCHA_PURE_CODE_ENABLED =
   Deno.env.get("AUTO_CAPTCHA_PURE_CODE_ENABLED") === "true";
 const AUTO_CAPTCHA_PURE_CODE_TIMEOUT_MS = Number(
-  Deno.env.get("AUTO_CAPTCHA_PURE_CODE_TIMEOUT_MS") || "25000"
+  Deno.env.get("AUTO_CAPTCHA_PURE_CODE_TIMEOUT_MS") || "25000",
 );
 const AUTO_CAPTCHA_SESSION_MAX_AGE_MS = Number(
-  Deno.env.get("AUTO_CAPTCHA_SESSION_MAX_AGE_MS") || "120000"
+  Deno.env.get("AUTO_CAPTCHA_SESSION_MAX_AGE_MS") || "120000",
 );
 const AUTO_CAPTCHA_REUSE_ENABLED =
-  Deno.env.get("AUTO_CAPTCHA_REUSE_ENABLED") === "true";
+  Deno.env.get("AUTO_CAPTCHA_REUSE_ENABLED") !== "false";
+const AUTO_CAPTCHA_BLOCKING_ATTACH =
+  Deno.env.get("AUTO_CAPTCHA_BLOCKING_ATTACH") === "true";
+const AUTO_CAPTCHA_BACKGROUND_PREFETCH =
+  Deno.env.get("AUTO_CAPTCHA_BACKGROUND_PREFETCH") !== "false";
 const AUTO_CAPTCHA_PURE_CODE_CLEAN_STALE_WORKERS =
   Deno.env.get("AUTO_CAPTCHA_PURE_CODE_CLEAN_STALE_WORKERS") !== "false";
 const AUTO_CAPTCHA_PURE_CODE_WORKER_MAX_OLD_SPACE_MB = Math.max(
   256,
-  Number(Deno.env.get("AUTO_CAPTCHA_PURE_CODE_WORKER_MAX_OLD_SPACE_MB") || "512"),
+  Number(
+    Deno.env.get("AUTO_CAPTCHA_PURE_CODE_WORKER_MAX_OLD_SPACE_MB") || "512",
+  ),
+);
+const AUTO_CAPTCHA_PURE_CODE_IDLE_TIMEOUT_MS = Number(
+  Deno.env.get("AUTO_CAPTCHA_PURE_CODE_IDLE_TIMEOUT_MS") || "300000",
+);
+const CURL_CONNECT_TIMEOUT_SECONDS = Math.max(
+  3,
+  Number(Deno.env.get("CURL_CONNECT_TIMEOUT_SECONDS") || "10"),
+);
+const CURL_MAX_TIME_SECONDS = Math.max(
+  CURL_CONNECT_TIMEOUT_SECONDS,
+  Number(Deno.env.get("CURL_MAX_TIME_SECONDS") || "40"),
+);
+const UPSTREAM_FETCH_TIMEOUT_MS = Math.max(
+  5000,
+  Number(Deno.env.get("UPSTREAM_FETCH_TIMEOUT_MS") || "60000"),
 );
 const UPSTREAM_EXTRA_COOKIE_HEADER =
   (Deno.env.get("UPSTREAM_EXTRA_COOKIE_HEADER") || "").trim();
@@ -1183,7 +2562,7 @@ const UPSTREAM_BROWSER_USER_NAME =
 const AUTO_CAPTCHA_MODEL_REGEX = new RegExp(
   Deno.env.get("AUTO_CAPTCHA_MODEL_REGEX") ||
     "^(0727-360B-API|0808-360B-DR|glm-4(?:\\.5(?:-air|-flash|-x)?|\\.6|\\.7)?|glm-5(?:\\.0)?)$",
-  "i"
+  "i",
 );
 
 /**
@@ -1215,12 +2594,14 @@ class TokenPool {
     // 从环境变量读取多个 Token，用逗号分隔
     const tokenEnv = Deno.env.get("ZAI_TOKENS");
     if (tokenEnv) {
-      const tokenList = tokenEnv.split(",").map(t => t.trim()).filter(t => t.length > 0);
-      this.tokens = tokenList.map(token => ({
+      const tokenList = tokenEnv.split(",").map((t) => t.trim()).filter((t) =>
+        t.length > 0
+      );
+      this.tokens = tokenList.map((token) => ({
         token,
         isValid: true,
         lastUsed: 0,
-        failureCount: 0
+        failureCount: 0,
       }));
       debugLog("Token 池已初始化，包含 %d 个 Token", this.tokens.length);
     } else if (ZAI_TOKEN) {
@@ -1229,7 +2610,7 @@ class TokenPool {
         token: ZAI_TOKEN,
         isValid: true,
         lastUsed: 0,
-        failureCount: 0
+        failureCount: 0,
       }];
       debugLog("使用单个 Token 配置");
     } else {
@@ -1272,6 +2653,8 @@ class TokenPool {
     do {
       const tokenInfo = this.tokens[this.currentIndex];
       if (tokenInfo.isValid && tokenInfo.failureCount < 3) {
+        // 吸收 ds2api 的多账号轮询（Round-Robin）负载均衡优点，成功获取后步进索引分摊并发压力！
+        this.currentIndex = (this.currentIndex + 1) % this.tokens.length;
         return tokenInfo;
       }
       this.currentIndex = (this.currentIndex + 1) % this.tokens.length;
@@ -1283,23 +2666,24 @@ class TokenPool {
   /**
    * 切换到下一个 Token（当前 Token 失败时调用）
    */
-  async switchToNext(): Promise<string | null> {
+  async switchToNext(failedToken?: string): Promise<string | null> {
     if (this.tokens.length === 0) return null;
 
-    // 标记当前 Token 为失败
-    const currentToken = this.tokens[this.currentIndex];
-    currentToken.failureCount++;
-    if (currentToken.failureCount >= 3) {
-      currentToken.isValid = false;
-      debugLog("Token 已标记为无效: %s", currentToken.token.substring(0, 20));
+    const failedTokenInfo = failedToken
+      ? this.tokens.find((item) => item.token === failedToken)
+      : this.tokens[this.currentIndex];
+    if (failedTokenInfo) {
+      failedTokenInfo.failureCount++;
+      if (failedTokenInfo.failureCount >= 3) {
+        failedTokenInfo.isValid = false;
+        debugLog("Token 已标记为无效: %s", maskToken(failedTokenInfo.token));
+      }
     }
 
-    // 切换到下一个
-    this.currentIndex = (this.currentIndex + 1) % this.tokens.length;
-    const nextToken = this.tokens[this.currentIndex];
+    const nextToken = this.getNextValidToken();
 
-    if (nextToken && nextToken.isValid) {
-      debugLog("切换到下一个 Token: %s", nextToken.token.substring(0, 20));
+    if (nextToken) {
+      debugLog("切换到下一个 Token: %s", maskToken(nextToken.token));
       nextToken.lastUsed = Date.now();
       return nextToken.token;
     }
@@ -1311,7 +2695,7 @@ class TokenPool {
    * 重置 Token 状态（成功调用后）
    */
   markSuccess(token: string): void {
-    const tokenInfo = this.tokens.find(t => t.token === token);
+    const tokenInfo = this.tokens.find((t) => t.token === token);
     if (tokenInfo) {
       tokenInfo.failureCount = 0;
       tokenInfo.isValid = true;
@@ -1375,7 +2759,8 @@ class TokenPool {
    * 检查是否为匿名 Token
    */
   isAnonymousToken(token: string): boolean {
-    return this.anonymousToken === token || anonymousBootstrapState?.authToken === token;
+    return this.anonymousToken === token ||
+      anonymousBootstrapState?.authToken === token;
   }
 }
 
@@ -1393,19 +2778,54 @@ interface CaptchaSessionState {
   workerLastPayloadSource: string | null;
 }
 
-const captchaSessionState: CaptchaSessionState = {
-  captchaVerifyParam: null,
-  token: null,
-  source: null,
-  updatedAt: null,
-  useCount: 0,
-  lastWorkerAttemptAt: null,
-  lastWorkerError: null,
-  workerLastPayloadSource: null,
-};
+const captchaSessionStates = new Map<string, CaptchaSessionState>();
 
-let pendingCaptchaFetches = new Map<string, Promise<Record<string, unknown> | null>>();
+function getOrCreateCaptchaSessionState(token: string): CaptchaSessionState {
+  const key = token || "anonymous";
+  let state = captchaSessionStates.get(key);
+  if (!state) {
+    state = {
+      captchaVerifyParam: null,
+      token: token || null,
+      source: null,
+      updatedAt: null,
+      useCount: 0,
+      lastWorkerAttemptAt: null,
+      lastWorkerError: null,
+      workerLastPayloadSource: null,
+    };
+    captchaSessionStates.set(key, state);
+  }
+  return state;
+}
+
+let pendingCaptchaFetches = new Map<
+  string,
+  Promise<Record<string, unknown> | null>
+>();
+let pendingCaptchaPrefetches = new Map<string, Promise<void>>();
 let cachedResolvedProxyUrlPromise: Promise<string | null> | null = null;
+
+function generateDeterministicUUID(seed: string): string {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x811c9dc5;
+  for (let i = 0; i < seed.length; i++) {
+    const charCode = seed.charCodeAt(i);
+    h1 ^= charCode;
+    h1 += (h1 << 1) + (h1 << 4) + (h1 << 7) + (h1 << 8) + (h1 << 24);
+    h2 ^= charCode;
+    h2 = Math.imul(h2, 0x5bd1e995);
+    h2 ^= h2 >>> 15;
+  }
+  const hex1 = (h1 >>> 0).toString(16).padStart(8, "0");
+  const hex2 = (h2 >>> 0).toString(16).padStart(8, "0");
+  const hex3 = ((h1 ^ h2) >>> 0).toString(16).padStart(8, "0");
+  const hex4 = ((h1 & h2) >>> 0).toString(16).padStart(8, "0");
+
+  return `${hex1}-${hex2.slice(0, 4)}-4${hex2.slice(4, 7)}-8${
+    hex3.slice(0, 3)
+  }-${hex3.slice(3)}${hex4.slice(0, 7)}`;
+}
 
 interface UpstreamChatSessionState {
   chatId: string;
@@ -1414,144 +2834,591 @@ interface UpstreamChatSessionState {
   updatedAt: number;
 }
 
-const upstreamChatSessions = new Map<string, UpstreamChatSessionState>();
+interface LocalOpenAIConversationState {
+  messages: Message[];
+  updatedAt: number;
+}
 
-function getUpstreamChatSession(token: string): UpstreamChatSessionState | null {
-  const session = upstreamChatSessions.get(token);
+const CHAT_SESSIONS_FILE = "./chat_sessions.json";
+const upstreamChatSessions = new Map<string, UpstreamChatSessionState>();
+const localOpenAIConversationStates = new Map<
+  string,
+  LocalOpenAIConversationState
+>();
+const responsesConversationAliases = new Map<string, string>();
+const responsesObjectStore = new Map<
+  string,
+  { owner: string; payload: Record<string, unknown>; updatedAt: number }
+>();
+const RESPONSES_OBJECT_TTL_MS = 24 * 60 * 60 * 1000;
+interface StoredFileRecord {
+  owner: string;
+  id: string;
+  object: "file";
+  bytes: number;
+  created_at: number;
+  filename: string;
+  purpose: string;
+  content?: string;
+  contentBytes?: Uint8Array;
+  contentPath?: string;
+  contentType?: string;
+}
+const fileObjectStore = new Map<string, StoredFileRecord>();
+const FILE_OBJECT_TTL_MS = 24 * 60 * 60 * 1000;
+const FILE_STORAGE_DIR = Deno.env.get("ZTOAPI_FILE_STORAGE_DIR") ||
+  ".ztoapi-files";
+let fileStoreLoaded = false;
+
+function loadUpstreamChatSessions(): void {
+  try {
+    const content = Deno.readTextFileSync(CHAT_SESSIONS_FILE);
+    const data = JSON.parse(content) as Record<
+      string,
+      UpstreamChatSessionState
+    >;
+    const now = Date.now();
+    let count = 0;
+    let migratedCount = 0;
+    for (const [key, val] of Object.entries(data)) {
+      // 仅保留24小时内的会话，防止文件无限增大
+      if (now - val.updatedAt < 24 * 60 * 60 * 1000) {
+        const safeKey = migrateLegacyChatSessionKey(key);
+        upstreamChatSessions.set(safeKey, val);
+        if (safeKey !== key) {
+          migratedCount++;
+        }
+        count++;
+      }
+    }
+    if (count > 0) {
+      debugLog(
+        "成功载入 %d 个持久化 Chat 会话映射关系，迁移旧 token key=%d",
+        count,
+        migratedCount,
+      );
+    }
+    if (migratedCount > 0) {
+      // 立即写回，避免旧版明文 token key 长期留在 chat_sessions.json。
+      saveUpstreamChatSessions();
+    }
+  } catch (error) {
+    if (!(error instanceof Deno.errors.NotFound)) {
+      debugLog("载入持久化 Chat 会话失败: %v", error);
+    }
+  }
+}
+
+function saveUpstreamChatSessions(): void {
+  const tempFile =
+    `${CHAT_SESSIONS_FILE}.${Date.now()}-${crypto.randomUUID()}.tmp`;
+  try {
+    const data: Record<string, UpstreamChatSessionState> = {};
+    const now = Date.now();
+    for (const [key, val] of upstreamChatSessions.entries()) {
+      if (now - val.updatedAt < 24 * 60 * 60 * 1000) {
+        data[key] = val;
+      }
+    }
+    Deno.writeTextFileSync(tempFile, JSON.stringify(data, null, 2));
+    Deno.renameSync(tempFile, CHAT_SESSIONS_FILE);
+  } catch (error) {
+    try {
+      Deno.removeSync(tempFile);
+    } catch {
+      // ignore cleanup failure
+    }
+    debugLog("持久化 Chat 会话失败: %v", error);
+  }
+}
+
+function getUpstreamChatSession(
+  sessionKey: string,
+): UpstreamChatSessionState | null {
+  const session = upstreamChatSessions.get(sessionKey);
   if (!session) {
     return null;
   }
-  if (Date.now() - session.updatedAt > 30 * 60 * 1000) {
-    upstreamChatSessions.delete(token);
+  if (Date.now() - session.updatedAt > 24 * 60 * 60 * 1000) {
+    upstreamChatSessions.delete(sessionKey);
+    saveUpstreamChatSessions();
     return null;
   }
   return session;
 }
 
+function normalizeClientConversationId(
+  value: string | null | undefined,
+): string {
+  const normalized = String(value || "").trim();
+  if (!normalized) {
+    return "";
+  }
+  return normalized.length > 160 ? normalized.slice(0, 160) : normalized;
+}
+
+function buildTokenSessionPrefix(authToken: string): string {
+  return `tok:${
+    generateDeterministicUUID(`${UPSTREAM_SESSION_KEY_SECRET}:${authToken}`)
+  }`;
+}
+
+function buildChatSessionKey(authToken: string, scope: string): string {
+  return `${buildTokenSessionPrefix(authToken)}:${scope}`;
+}
+
+function buildClientChatSessionKey(scope: string): string {
+  return `client:${
+    generateDeterministicUUID(`${UPSTREAM_SESSION_KEY_SECRET}:${scope}`)
+  }:${scope}`;
+}
+
+function migrateLegacyChatSessionKey(key: string): string {
+  if (key.startsWith("tok:")) {
+    return key;
+  }
+  const separatorIndex = key.indexOf(":");
+  if (separatorIndex <= 0) {
+    return key;
+  }
+  const possibleToken = key.slice(0, separatorIndex);
+  const scope = key.slice(separatorIndex + 1);
+  if (!possibleToken.startsWith("eyJ") || !scope) {
+    return key;
+  }
+  return buildChatSessionKey(possibleToken, scope);
+}
+
+function updateUpstreamChatSessionAliases(
+  sessionKeys: string[],
+  update: {
+    chatId: string;
+    lastUserMessageId?: string | null;
+    lastAssistantMessageId?: string | null;
+  },
+): void {
+  for (const key of new Set(sessionKeys.filter(Boolean))) {
+    updateUpstreamChatSession(key, update);
+  }
+}
+
+function messageContentFingerprint(content: Message["content"]): string {
+  if (typeof content === "string") {
+    return content.trim().replace(/\s+/g, " ");
+  }
+  return JSON.stringify(content ?? null);
+}
+
+function messageFingerprint(message: Message): string {
+  const toolCalls = message.tool_calls?.map((toolCall) => ({
+    id: toolCall.id,
+    name: toolCall.function?.name,
+    arguments: toolCall.function?.arguments,
+  })) || [];
+  return JSON.stringify({
+    role: message.role,
+    name: message.name || "",
+    tool_call_id: message.tool_call_id || "",
+    content: messageContentFingerprint(message.content),
+    tool_calls: toolCalls,
+  });
+}
+
+function messagesEqualForContext(a: Message, b: Message): boolean {
+  return messageFingerprint(a) === messageFingerprint(b);
+}
+
+function mergeLocalHistoryWithIncoming(
+  localMessages: Message[],
+  incomingMessages: Message[],
+): Message[] {
+  if (!localMessages.length) {
+    return incomingMessages;
+  }
+  if (!incomingMessages.length) {
+    return localMessages;
+  }
+  const maxOverlap = Math.min(localMessages.length, incomingMessages.length);
+  for (let overlap = maxOverlap; overlap > 0; overlap--) {
+    let matched = true;
+    for (let i = 0; i < overlap; i++) {
+      if (
+        !messagesEqualForContext(
+          localMessages[localMessages.length - overlap + i],
+          incomingMessages[i],
+        )
+      ) {
+        matched = false;
+        break;
+      }
+    }
+    if (matched) {
+      return [...localMessages, ...incomingMessages.slice(overlap)];
+    }
+  }
+  return [...localMessages, ...incomingMessages];
+}
+
+function hasAssistantPayload(message: Message): boolean {
+  return message.role === "assistant" &&
+    (messageContentFingerprint(message.content).length > 0 ||
+      !!message.tool_calls?.length);
+}
+
+function getLocalOpenAIConversationState(
+  sessionKey: string,
+): LocalOpenAIConversationState | null {
+  const state = localOpenAIConversationStates.get(sessionKey);
+  if (!state) {
+    return null;
+  }
+  if (Date.now() - state.updatedAt > 24 * 60 * 60 * 1000) {
+    localOpenAIConversationStates.delete(sessionKey);
+    return null;
+  }
+  return state;
+}
+
+function findRecentLocalOpenAIConversationByToken(
+  authToken: string,
+  maxAgeMs = 5 * 60 * 1000,
+): LocalOpenAIConversationState | null {
+  const now = Date.now();
+  const tokenPrefix = `${buildTokenSessionPrefix(authToken)}:`;
+  let best: LocalOpenAIConversationState | null = null;
+  for (const [key, state] of localOpenAIConversationStates.entries()) {
+    if (!key.startsWith(tokenPrefix)) {
+      continue;
+    }
+    if (now - state.updatedAt > maxAgeMs) {
+      continue;
+    }
+    if (!best || state.updatedAt > best.updatedAt) {
+      best = state;
+    }
+  }
+  return best;
+}
+
+function rememberLocalOpenAIConversation(
+  sessionKeys: string[],
+  messages: Message[],
+): void {
+  const compactedMessages = compactContextMessages(messages);
+  const trimmedMessages = compactedMessages.slice(-80).map((message) => ({
+    ...message,
+  }));
+  const state: LocalOpenAIConversationState = {
+    messages: trimmedMessages,
+    updatedAt: Date.now(),
+  };
+  for (const key of new Set(sessionKeys.filter(Boolean))) {
+    localOpenAIConversationStates.set(key, state);
+  }
+}
+
+function compactContextMessages(messages: Message[]): Message[] {
+  const out: Message[] = [];
+  for (const message of messages) {
+    const previous = out[out.length - 1];
+    if (previous && messagesEqualForContext(previous, message)) {
+      continue;
+    }
+    out.push(message);
+  }
+  return out;
+}
+
+function rememberLocalOpenAIConversationWithAssistant(
+  sessionKeys: string[],
+  requestMessages: Message[],
+  assistantMessage: Message,
+): void {
+  const baseMessages = compactContextMessages(requestMessages);
+  const previous = baseMessages[baseMessages.length - 1];
+  const nextMessages =
+    previous && messagesEqualForContext(previous, assistantMessage)
+      ? baseMessages
+      : [...baseMessages, assistantMessage];
+  rememberLocalOpenAIConversation(sessionKeys, nextMessages);
+}
+
+function appendAssistantToLocalOpenAIConversation(
+  sessionKeys: string[],
+  requestMessages: Message[],
+  assistantContent: string,
+  assistantReasoningContent = "",
+): void {
+  const normalizedContent = assistantContent.trim();
+  if (!normalizedContent) {
+    return;
+  }
+  const assistantMessage: Message = {
+    role: "assistant",
+    content: normalizedContent,
+    ...(assistantReasoningContent.trim()
+      ? { reasoning_content: assistantReasoningContent.trim() }
+      : {}),
+  };
+  rememberLocalOpenAIConversationWithAssistant(
+    sessionKeys,
+    requestMessages,
+    assistantMessage,
+  );
+}
+
+function findRecentUpstreamChatSessionByToken(
+  authToken: string,
+  maxAgeMs = 5 * 60 * 1000,
+): UpstreamChatSessionState | null {
+  const now = Date.now();
+  const tokenPrefix = `${buildTokenSessionPrefix(authToken)}:`;
+  let best: UpstreamChatSessionState | null = null;
+  for (const [key, session] of upstreamChatSessions.entries()) {
+    if (!key.startsWith(tokenPrefix)) {
+      continue;
+    }
+    if (now - session.updatedAt > maxAgeMs) {
+      continue;
+    }
+    if (!best || session.updatedAt > best.updatedAt) {
+      best = session;
+    }
+  }
+  return best;
+}
+
 function updateUpstreamChatSession(
-  token: string,
+  sessionKey: string,
   update: {
     chatId: string;
     lastUserMessageId?: string | null;
     lastAssistantMessageId?: string | null;
   },
 ): UpstreamChatSessionState {
-  const current = upstreamChatSessions.get(token);
+  const current = upstreamChatSessions.get(sessionKey);
   const next: UpstreamChatSessionState = {
     chatId: update.chatId,
-    lastUserMessageId: Object.prototype.hasOwnProperty.call(update, "lastUserMessageId")
-      ? update.lastUserMessageId ?? null
-      : current?.lastUserMessageId ?? null,
-    lastAssistantMessageId: Object.prototype.hasOwnProperty.call(update, "lastAssistantMessageId")
-      ? update.lastAssistantMessageId ?? null
-      : current?.lastAssistantMessageId ?? null,
+    lastUserMessageId:
+      Object.prototype.hasOwnProperty.call(update, "lastUserMessageId")
+        ? update.lastUserMessageId ?? null
+        : current?.lastUserMessageId ?? null,
+    lastAssistantMessageId:
+      Object.prototype.hasOwnProperty.call(update, "lastAssistantMessageId")
+        ? update.lastAssistantMessageId ?? null
+        : current?.lastAssistantMessageId ?? null,
     updatedAt: Date.now(),
   };
-  upstreamChatSessions.set(token, next);
+  upstreamChatSessions.set(sessionKey, next);
+  saveUpstreamChatSessions();
   return next;
 }
 
-function getCaptchaSessionSnapshot() {
+function getCaptchaSessionSnapshot(token?: string) {
+  if (token) {
+    const state = getOrCreateCaptchaSessionState(token);
+    return {
+      has_captcha: !!state.captchaVerifyParam,
+      has_token: !!state.token,
+      source: state.source,
+      updated_at: state.updatedAt,
+      age_ms: state.updatedAt ? Date.now() - state.updatedAt : null,
+      use_count: state.useCount,
+      worker_last_attempt_at: state.lastWorkerAttemptAt,
+      worker_last_error: state.lastWorkerError,
+      worker_last_payload_source: state.workerLastPayloadSource,
+      captcha_preview: state.captchaVerifyParam
+        ? state.captchaVerifyParam.slice(0, 48)
+        : null,
+      token_preview: state.token ? state.token.slice(0, 24) : null,
+    };
+  }
+
+  // Find the most recently updated session for backward-compatibility
+  let latestState: CaptchaSessionState | null = null;
+  for (const s of captchaSessionStates.values()) {
+    if (
+      s.updatedAt &&
+      (!latestState || (s.updatedAt > (latestState.updatedAt || 0)))
+    ) {
+      latestState = s;
+    }
+  }
+  const primaryState = latestState ||
+    getOrCreateCaptchaSessionState("anonymous");
+
   return {
-    has_captcha: !!captchaSessionState.captchaVerifyParam,
-    has_token: !!captchaSessionState.token,
-    source: captchaSessionState.source,
-    updated_at: captchaSessionState.updatedAt,
-    age_ms: captchaSessionState.updatedAt
-      ? Date.now() - captchaSessionState.updatedAt
+    has_captcha: !!primaryState.captchaVerifyParam,
+    has_token: !!primaryState.token,
+    source: primaryState.source,
+    updated_at: primaryState.updatedAt,
+    age_ms: primaryState.updatedAt ? Date.now() - primaryState.updatedAt : null,
+    use_count: primaryState.useCount,
+    worker_last_attempt_at: primaryState.lastWorkerAttemptAt,
+    worker_last_error: primaryState.lastWorkerError,
+    worker_last_payload_source: primaryState.workerLastPayloadSource,
+    captcha_preview: primaryState.captchaVerifyParam
+      ? primaryState.captchaVerifyParam.slice(0, 48)
       : null,
-    use_count: captchaSessionState.useCount,
-    worker_last_attempt_at: captchaSessionState.lastWorkerAttemptAt,
-    worker_last_error: captchaSessionState.lastWorkerError,
-    worker_last_payload_source: captchaSessionState.workerLastPayloadSource,
-    captcha_preview: captchaSessionState.captchaVerifyParam
-      ? captchaSessionState.captchaVerifyParam.slice(0, 48)
-      : null,
-    token_preview: captchaSessionState.token
-      ? captchaSessionState.token.slice(0, 24)
-      : null,
+    token_preview: primaryState.token ? primaryState.token.slice(0, 24) : null,
+    active_sessions_count: captchaSessionStates.size,
+    sessions: Array.from(captchaSessionStates.entries()).map(([k, s]) => ({
+      token_key: k,
+      has_captcha: !!s.captchaVerifyParam,
+      updated_at: s.updatedAt,
+      use_count: s.useCount,
+      worker_last_payload_source: s.workerLastPayloadSource,
+      last_worker_error: s.lastWorkerError,
+    })),
   };
 }
 
-function isCaptchaSessionFresh(): boolean {
-  if (!captchaSessionState.captchaVerifyParam || !captchaSessionState.updatedAt) {
+function isCaptchaSessionFresh(token: string): boolean {
+  const state = getOrCreateCaptchaSessionState(token);
+  if (
+    !state.captchaVerifyParam || !state.updatedAt
+  ) {
     return false;
   }
-  return Date.now() - captchaSessionState.updatedAt <= AUTO_CAPTCHA_SESSION_MAX_AGE_MS;
+  return Date.now() - state.updatedAt <=
+    AUTO_CAPTCHA_SESSION_MAX_AGE_MS;
 }
 
-function hasReusableCaptchaVerifyParam(authToken: string): boolean {
+function hasReusableCaptchaVerifyParam(token: string): boolean {
   if (!AUTO_CAPTCHA_REUSE_ENABLED) {
     return false;
   }
-  if (!isCaptchaSessionFresh()) {
+  if (!isCaptchaSessionFresh(token)) {
     return false;
   }
-  if (!captchaSessionState.captchaVerifyParam) {
+  const state = getOrCreateCaptchaSessionState(token);
+  if (!state.captchaVerifyParam) {
     return false;
   }
-  if (captchaSessionState.token && captchaSessionState.token !== authToken) {
-    return false;
-  }
-  return captchaSessionState.useCount === 0;
+  return state.useCount === 0;
 }
 
-function updateCaptchaSessionState(update: {
-  captchaVerifyParam?: string | null;
-  token?: string | null;
-  source?: string | null;
-  workerLastPayloadSource?: string | null;
-  workerLastError?: string | null;
-}) {
+function updateCaptchaSessionState(
+  token: string,
+  update: {
+    captchaVerifyParam?: string | null;
+    source?: string | null;
+    workerLastPayloadSource?: string | null;
+    workerLastError?: string | null;
+  },
+) {
+  const state = getOrCreateCaptchaSessionState(token);
   if (Object.prototype.hasOwnProperty.call(update, "captchaVerifyParam")) {
-    captchaSessionState.captchaVerifyParam = update.captchaVerifyParam ?? null;
-    captchaSessionState.updatedAt = update.captchaVerifyParam ? Date.now() : null;
-    captchaSessionState.useCount = update.captchaVerifyParam ? 0 : 0;
-  }
-  if (Object.prototype.hasOwnProperty.call(update, "token")) {
-    captchaSessionState.token = update.token ?? null;
+    state.captchaVerifyParam = update.captchaVerifyParam ?? null;
+    state.updatedAt = update.captchaVerifyParam ? Date.now() : null;
+    state.useCount = update.captchaVerifyParam ? 0 : 0;
   }
   if (Object.prototype.hasOwnProperty.call(update, "source")) {
-    captchaSessionState.source = update.source ?? null;
+    state.source = update.source ?? null;
   }
   if (Object.prototype.hasOwnProperty.call(update, "workerLastPayloadSource")) {
-    captchaSessionState.workerLastPayloadSource = update.workerLastPayloadSource ?? null;
+    state.workerLastPayloadSource = update.workerLastPayloadSource ?? null;
   }
   if (Object.prototype.hasOwnProperty.call(update, "workerLastError")) {
-    captchaSessionState.lastWorkerError = update.workerLastError ?? null;
+    state.lastWorkerError = update.workerLastError ?? null;
   }
 }
 
-function markCaptchaVerifyParamConsumed(reason: string) {
-  if (!captchaSessionState.captchaVerifyParam) {
+function markCaptchaVerifyParamConsumed(token: string, reason: string) {
+  const state = getOrCreateCaptchaSessionState(token);
+  if (!state.captchaVerifyParam) {
     return;
   }
-  captchaSessionState.useCount += 1;
+  state.useCount += 1;
   debugLog(
-    "captcha_verify_param 已消费: reason=%s use_count=%d source=%s",
+    "token=%s 的 captcha_verify_param 已消费: reason=%s use_count=%d source=%s",
+    token.slice(0, 16) + "...",
     reason,
-    captchaSessionState.useCount,
-    captchaSessionState.source || "",
+    state.useCount,
+    state.source || "",
   );
 }
 
-function invalidateCaptchaVerifyParam(reason: string) {
-  if (!captchaSessionState.captchaVerifyParam && !captchaSessionState.updatedAt) {
+function invalidateCaptchaVerifyParam(token: string, reason: string) {
+  const state = getOrCreateCaptchaSessionState(token);
+  if (
+    !state.captchaVerifyParam && !state.updatedAt
+  ) {
     return;
   }
   debugLog(
-    "丢弃缓存 captcha_verify_param: reason=%s source=%s age_ms=%s use_count=%d",
+    "token=%s 丢弃缓存 captcha_verify_param: reason=%s source=%s age_ms=%s use_count=%d",
+    token.slice(0, 16) + "...",
     reason,
-    captchaSessionState.source || "",
-    captchaSessionState.updatedAt ? String(Date.now() - captchaSessionState.updatedAt) : "n/a",
-    captchaSessionState.useCount,
+    state.source || "",
+    state.updatedAt ? String(Date.now() - state.updatedAt) : "n/a",
+    state.useCount,
   );
-  captchaSessionState.captchaVerifyParam = null;
-  captchaSessionState.updatedAt = null;
-  captchaSessionState.useCount = 0;
+  state.captchaVerifyParam = null;
+  state.updatedAt = null;
+  state.useCount = 0;
 }
 
-function isUpstreamCaptchaError(errObj: UpstreamError | null | undefined): boolean {
+function scheduleCaptchaPrefetch(
+  token: string,
+  refererChatID: string,
+  reason: string,
+): void {
+  if (!AUTO_CAPTCHA_BACKGROUND_PREFETCH || !AUTO_CAPTCHA_PURE_CODE_ENABLED) {
+    return;
+  }
+  const key = `${token || "anonymous"}:${refererChatID || ""}`;
+  if (pendingCaptchaPrefetches.has(key)) {
+    return;
+  }
+
+  const job = (async () => {
+    try {
+      const payload = await getFreshCaptchaPayload(token, refererChatID);
+      const captchaVerifyParam = typeof payload?.captcha_verify_param ===
+          "string"
+        ? payload.captcha_verify_param
+        : null;
+      const payloadSource = typeof payload?.source === "string"
+        ? payload.source
+        : null;
+      if (
+        captchaVerifyParam &&
+        (payloadSource === "pure-code-worker-live-verify" ||
+          payloadSource === "pure-code-worker-compact-live-replay")
+      ) {
+        updateCaptchaSessionState(token, {
+          captchaVerifyParam,
+          source: `pure-code-worker-prefetch:${reason}`,
+          workerLastPayloadSource: payloadSource,
+          workerLastError: null,
+        });
+        debugLog(
+          "captcha 后台预取完成: reason=%s source=%s",
+          reason,
+          payloadSource,
+        );
+      }
+    } catch (error) {
+      updateCaptchaSessionState(token, {
+        workerLastError: String(error && (error as Error).stack || error),
+      });
+      debugLog(
+        "captcha 后台预取失败: reason=%s error=%s",
+        reason,
+        String(error),
+      );
+    } finally {
+      pendingCaptchaPrefetches.delete(key);
+    }
+  })();
+
+  pendingCaptchaPrefetches.set(key, job);
+}
+
+function isUpstreamCaptchaError(
+  errObj: UpstreamError | null | undefined,
+): boolean {
   if (!errObj) return false;
   const code = String(errObj.code ?? "");
   const errorCode = String(errObj.error_code ?? "");
@@ -1594,8 +3461,29 @@ class HiddenPureCodeWorkerBridge {
   private lastReadyPayload: Record<string, unknown> | null = null;
   private lastStdErrLine: string | null = null;
   private staleCleanupAttempted = false;
+  private idleTimer: number | null = null;
+
+  private resetIdleTimer() {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
+    if (AUTO_CAPTCHA_PURE_CODE_IDLE_TIMEOUT_MS > 0 && this.process) {
+      this.idleTimer = setTimeout(() => {
+        debugLog(
+          "pure-code worker 闲置超时 (%d ms)，自动关闭以释放资源",
+          AUTO_CAPTCHA_PURE_CODE_IDLE_TIMEOUT_MS,
+        );
+        this.disposeProcess("idle-timeout");
+      }, AUTO_CAPTCHA_PURE_CODE_IDLE_TIMEOUT_MS) as unknown as number;
+    }
+  }
 
   private disposeProcess(reason = "manual-reset") {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
     const oldPid = this.processPid;
     if (this.stdinWriter) {
       try {
@@ -1658,13 +3546,16 @@ class HiddenPureCodeWorkerBridge {
     if (this.startupPromise) return await this.startupPromise;
 
     this.startupPromise = (async () => {
-      if (!this.staleCleanupAttempted && AUTO_CAPTCHA_PURE_CODE_CLEAN_STALE_WORKERS) {
+      if (
+        !this.staleCleanupAttempted &&
+        AUTO_CAPTCHA_PURE_CODE_CLEAN_STALE_WORKERS
+      ) {
         this.staleCleanupAttempted = true;
         try {
           const cleanup = new Deno.Command("bash", {
             args: [
               "-lc",
-              "pids=$(ps -eo pid=,cmd= | awk '/node tools\\/pure_code_captcha_worker\\.js/ && !/awk/ {print $1}'); if [ -n \"$pids\" ]; then echo \"$pids\" | xargs -r kill; fi",
+              'pids=$(ps -eo pid=,cmd= | awk \'/node tools\\/pure_code_captcha_worker\\.js/ && !/awk/ {print $1}\'); if [ -n "$pids" ]; then echo "$pids" | xargs -r kill; fi',
             ],
             stdout: "null",
             stderr: "null",
@@ -1702,7 +3593,9 @@ class HiddenPureCodeWorkerBridge {
             this.lastReadyPayload = payload;
             return;
           }
-          const requestId = typeof payload.request_id === "string" ? payload.request_id : null;
+          const requestId = typeof payload.request_id === "string"
+            ? payload.request_id
+            : null;
           if (requestId && this.pending.has(requestId)) {
             const pending = this.pending.get(requestId)!;
             clearTimeout(pending.timeoutId);
@@ -1747,6 +3640,10 @@ class HiddenPureCodeWorkerBridge {
     payload: Record<string, unknown>,
     timeoutMs = AUTO_CAPTCHA_PURE_CODE_TIMEOUT_MS,
   ): Promise<WorkerJsonResponse> {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
     await this.ensureStarted();
     if (!this.stdinWriter) {
       throw new Error("pure-code worker stdin unavailable");
@@ -1755,20 +3652,29 @@ class HiddenPureCodeWorkerBridge {
     const finalPayload = { ...payload, request_id: requestId };
     const line = `${JSON.stringify(finalPayload)}\n`;
 
-    return await new Promise<WorkerJsonResponse>((resolve, reject) => {
-      const timeoutId = setTimeout(() => {
-        this.pending.delete(requestId);
-        this.disposeProcess(`timeout:${requestId}`);
-        reject(new Error(`pure-code worker request timeout: ${requestId}`));
-      }, timeoutMs) as unknown as number;
+    try {
+      const result = await new Promise<WorkerJsonResponse>(
+        (resolve, reject) => {
+          const timeoutId = setTimeout(() => {
+            this.pending.delete(requestId);
+            this.disposeProcess(`timeout:${requestId}`);
+            reject(new Error(`pure-code worker request timeout: ${requestId}`));
+          }, timeoutMs) as unknown as number;
 
-      this.pending.set(requestId, { resolve, reject, timeoutId });
-      this.stdinWriter!.write(new TextEncoder().encode(line)).catch((err) => {
-        clearTimeout(timeoutId);
-        this.pending.delete(requestId);
-        reject(err);
-      });
-    });
+          this.pending.set(requestId, { resolve, reject, timeoutId });
+          this.stdinWriter!.write(new TextEncoder().encode(line)).catch(
+            (err) => {
+              clearTimeout(timeoutId);
+              this.pending.delete(requestId);
+              reject(err);
+            },
+          );
+        },
+      );
+      return result;
+    } finally {
+      this.resetIdleTimer();
+    }
   }
 
   async fetchCaptchaPayload(
@@ -1818,8 +3724,35 @@ class HiddenPureCodeWorkerBridge {
 
 const pureCodeWorkerBridge = new HiddenPureCodeWorkerBridge();
 
+function warmCaptchaWorkerInBackground(reason: string): void {
+  if (!AUTO_CAPTCHA_BACKGROUND_PREFETCH || !AUTO_CAPTCHA_PURE_CODE_ENABLED) {
+    return;
+  }
+  setTimeout(() => {
+    (async () => {
+      try {
+        await pureCodeWorkerBridge.warm();
+        const token = await tokenPool.getToken();
+        scheduleCaptchaPrefetch(token, "", reason);
+      } catch (error) {
+        debugLog(
+          "captcha 后台预热失败: reason=%s error=%s",
+          reason,
+          String(error),
+        );
+      }
+    })();
+  }, 0);
+}
+
+// 注册 Deno 进程退出钩子，确保平台无关地清理 Node 子进程，避免残留孤儿进程
+globalThis.addEventListener("unload", () => {
+  pureCodeWorkerBridge.reset("main-process-unload");
+});
+
 function shouldAttemptAutoCaptcha(modelId: string): boolean {
-  return AUTO_CAPTCHA_PURE_CODE_ENABLED && AUTO_CAPTCHA_MODEL_REGEX.test(modelId);
+  return AUTO_CAPTCHA_PURE_CODE_ENABLED &&
+    AUTO_CAPTCHA_MODEL_REGEX.test(modelId);
 }
 
 function formatBrowserDateTime(date: Date): string {
@@ -1834,7 +3767,9 @@ function formatBrowserDateTime(date: Date): string {
     hour12: false,
   });
   const parts = formatter.formatToParts(date);
-  const partMap = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  const partMap = Object.fromEntries(
+    parts.map((part) => [part.type, part.value]),
+  );
   return `${partMap.year}-${partMap.month}-${partMap.day} ${partMap.hour}:${partMap.minute}:${partMap.second}`;
 }
 
@@ -1857,13 +3792,16 @@ function getBrowserUserName(
   if (UPSTREAM_BROWSER_USER_NAME) {
     return UPSTREAM_BROWSER_USER_NAME;
   }
-  const profileName = typeof profile?.name === "string" ? profile.name.trim() : "";
+  const profileName = typeof profile?.name === "string"
+    ? profile.name.trim()
+    : "";
   if (profileName) {
     return profileName;
   }
-  const importedProfileName = typeof IMPORTED_BROWSER_CAPTURE_STATE.profileName === "string"
-    ? IMPORTED_BROWSER_CAPTURE_STATE.profileName.trim()
-    : "";
+  const importedProfileName =
+    typeof IMPORTED_BROWSER_CAPTURE_STATE.profileName === "string"
+      ? IMPORTED_BROWSER_CAPTURE_STATE.profileName.trim()
+      : "";
   if (importedProfileName) {
     return importedProfileName;
   }
@@ -1872,7 +3810,9 @@ function getBrowserUserName(
   if (name) {
     return name;
   }
-  const profileEmail = typeof profile?.email === "string" ? profile.email.trim() : "";
+  const profileEmail = typeof profile?.email === "string"
+    ? profile.email.trim()
+    : "";
   if (profileEmail) {
     return profileEmail.split("@")[0] || profileEmail;
   }
@@ -1894,7 +3834,14 @@ async function tryAttachCaptchaVerifyParam(
   upstreamReq: UpstreamRequest,
   authToken: string,
   modelId: string,
+  forceBlocking = false,
 ): Promise<void> {
+  const forceFreshCaptcha = forceBlocking;
+  forceBlocking = forceBlocking || shouldForceBlockingCaptchaAttach(
+    upstreamReq,
+    modelId,
+  );
+  const captchaAttachStartedAt = perfNow();
   const shouldAttempt = shouldAttemptAutoCaptcha(modelId);
   debugLog(
     "captcha attach 检查: model=%s shouldAttempt=%s hasExisting=%s",
@@ -1903,81 +3850,290 @@ async function tryAttachCaptchaVerifyParam(
     String(!!upstreamReq.captcha_verify_param),
   );
   if (upstreamReq.captcha_verify_param) {
-    return;
+    if (forceFreshCaptcha) {
+      invalidateCaptchaVerifyParam(authToken, "force-refresh-existing");
+      upstreamReq.captcha_verify_param = undefined;
+    } else {
+      debugCaptchaStageDuration(
+        "attach.skip-existing",
+        captchaAttachStartedAt,
+        `chat_id=${upstreamReq.chat_id || ""}`,
+      );
+      return;
+    }
   }
 
-  if (hasReusableCaptchaVerifyParam(authToken)) {
-    upstreamReq.captcha_verify_param = captchaSessionState.captchaVerifyParam!;
-    markCaptchaVerifyParamConsumed("reuse");
-    debugLog("复用缓存 captcha_verify_param: source=%s", captchaSessionState.source);
+  if (!forceFreshCaptcha && hasReusableCaptchaVerifyParam(authToken)) {
+    const state = getOrCreateCaptchaSessionState(authToken);
+    upstreamReq.captcha_verify_param = state.captchaVerifyParam!;
+    markCaptchaVerifyParamConsumed(authToken, "reuse");
+    scheduleCaptchaPrefetch(authToken, upstreamReq.chat_id || "", "reuse");
+    debugLog(
+      "复用缓存 captcha_verify_param: source=%s",
+      state.source,
+    );
+    debugCaptchaStageDuration(
+      "attach.reuse-hit",
+      captchaAttachStartedAt,
+      `chat_id=${upstreamReq.chat_id || ""}`,
+    );
     return;
   }
 
   if (!shouldAttempt) {
+    debugCaptchaStageDuration(
+      "attach.skip-model",
+      captchaAttachStartedAt,
+      `model=${modelId}`,
+    );
+    return;
+  }
+
+  if (!forceBlocking && !AUTO_CAPTCHA_BLOCKING_ATTACH) {
+    scheduleCaptchaPrefetch(
+      authToken,
+      upstreamReq.chat_id || "",
+      "nonblocking-miss",
+    );
+    debugCaptchaStageDuration(
+      "attach.deferred-prefetch",
+      captchaAttachStartedAt,
+      `chat_id=${upstreamReq.chat_id || ""}`,
+    );
     return;
   }
 
   try {
-    const payload = await getFreshCaptchaPayload(authToken, upstreamReq.chat_id || "");
+    const payload = await getFreshCaptchaPayload(
+      authToken,
+      upstreamReq.chat_id || "",
+    );
     const captchaVerifyParam = typeof payload?.captcha_verify_param === "string"
       ? payload.captcha_verify_param
       : null;
-    const payloadSource = typeof payload?.source === "string" ? payload.source : null;
+    const payloadSource = typeof payload?.source === "string"
+      ? payload.source
+      : null;
     if (!captchaVerifyParam) {
-      debugLog("pure-code worker 未返回可用 captcha_verify_param (source=%s)", payloadSource);
+      debugLog(
+        "pure-code worker 未返回可用 captcha_verify_param (source=%s)",
+        payloadSource,
+      );
       return;
     }
     if (
       payloadSource !== "pure-code-worker-live-verify" &&
       payloadSource !== "pure-code-worker-compact-live-replay"
     ) {
-      debugLog("忽略非真实 live 验证来源的 captcha_verify_param: source=%s", payloadSource);
+      debugLog(
+        "忽略非真实 live 验证来源的 captcha_verify_param: source=%s",
+        payloadSource,
+      );
       return;
     }
     upstreamReq.captcha_verify_param = captchaVerifyParam;
-    updateCaptchaSessionState({
+    updateCaptchaSessionState(authToken, {
       captchaVerifyParam,
-      token: authToken,
       source: "pure-code-worker",
       workerLastPayloadSource: payloadSource,
       workerLastError: null,
     });
-    markCaptchaVerifyParamConsumed("fresh");
-    debugLog("已注入 pure-code captcha_verify_param: %s", captchaVerifyParam.slice(0, 32));
+    markCaptchaVerifyParamConsumed(authToken, "fresh");
+    scheduleCaptchaPrefetch(authToken, upstreamReq.chat_id || "", "fresh");
+    debugLog(
+      "已注入 pure-code captcha_verify_param: %s",
+      captchaVerifyParam.slice(0, 32),
+    );
+    debugCaptchaStageDuration(
+      "attach.fresh",
+      captchaAttachStartedAt,
+      `chat_id=${upstreamReq.chat_id || ""} source=${payloadSource || ""}`,
+    );
   } catch (error) {
     const message = String(error && (error as Error).stack || error);
-    updateCaptchaSessionState({
+    updateCaptchaSessionState(authToken, {
       workerLastError: message,
     });
     debugLog("pure-code worker 获取 captcha 失败: %s", message);
+    debugCaptchaStageDuration(
+      "attach.failed",
+      captchaAttachStartedAt,
+      `chat_id=${upstreamReq.chat_id || ""}`,
+    );
   }
+}
+
+function shouldForceBlockingCaptchaAttach(
+  upstreamReq: UpstreamRequest,
+  modelId: string,
+): boolean {
+  if (AUTO_CAPTCHA_BLOCKING_ATTACH) {
+    return true;
+  }
+  const normalizedModelId = normalizeModelId(modelId).toLowerCase();
+  if (!normalizedModelId.includes("glm-5")) {
+    return false;
+  }
+  const lastUserContent = ImageProcessor.extractLastUserContent(
+    upstreamReq.messages,
+  ).toLowerCase();
+  if (lastUserContent.length >= 120) {
+    return true;
+  }
+  return /(?:\d{4,}\s*字|长文|小说|报告|论文|完整|详细|深入|5000|10000)/.test(
+    lastUserContent,
+  );
+}
+
+async function rebuildUpstreamRequestForCaptchaRetry(
+  upstreamReq: UpstreamRequest,
+  authToken: string,
+  requestMessages: Message[] = upstreamReq.messages,
+): Promise<{ upstreamReq: UpstreamRequest; chatID: string }> {
+  const retryMessages = requestMessages.length
+    ? compactContextMessages(requestMessages).map(sanitizeMessageForZai)
+    : upstreamReq.messages;
+  const assistantPlaceholderID = crypto.randomUUID();
+  const historyMessages: Record<string, UpstreamChatHistoryNode> = {};
+  let previousHistoryNodeId: string | null = null;
+  let currentUserMessageID: string | null = null;
+  let currentUserMessageParentID: string | null = null;
+
+  for (const message of retryMessages) {
+    const nodeId = crypto.randomUUID();
+    historyMessages[nodeId] = {
+      id: nodeId,
+      parentId: previousHistoryNodeId,
+      childrenIds: [],
+      role: message.role,
+      content: message.content,
+      timestamp: Math.floor(Date.now() / 1000),
+      ...(message.role === "user" ? { models: [upstreamReq.model] } : {}),
+    };
+    if (previousHistoryNodeId && historyMessages[previousHistoryNodeId]) {
+      historyMessages[previousHistoryNodeId].childrenIds.push(nodeId);
+    }
+    if (message.role === "user") {
+      currentUserMessageID = nodeId;
+      currentUserMessageParentID = previousHistoryNodeId;
+    }
+    previousHistoryNodeId = nodeId;
+  }
+
+  if (!currentUserMessageID) {
+    currentUserMessageID = crypto.randomUUID();
+    historyMessages[currentUserMessageID] = {
+      id: currentUserMessageID,
+      parentId: previousHistoryNodeId,
+      childrenIds: [],
+      role: "user",
+      content: ImageProcessor.extractLastUserContent(upstreamReq.messages),
+      timestamp: Math.floor(Date.now() / 1000),
+      models: [upstreamReq.model],
+    };
+    if (previousHistoryNodeId && historyMessages[previousHistoryNodeId]) {
+      historyMessages[previousHistoryNodeId].childrenIds.push(
+        currentUserMessageID,
+      );
+    }
+    currentUserMessageParentID = previousHistoryNodeId;
+  }
+
+  const bootstrapPayload: UpstreamChatBootstrapPayload = {
+    id: "",
+    title: "New Chat",
+    models: [upstreamReq.model],
+    params: upstreamReq.params || {},
+    history: {
+      messages: historyMessages,
+      currentId: currentUserMessageID,
+    },
+    tags: [],
+    flags: [],
+    features: MCP_FEATURES,
+    enable_thinking: upstreamReq.features?.enable_thinking === true,
+    auto_web_search: upstreamReq.features?.auto_web_search === true,
+    message_version: 1,
+    extra: {},
+    timestamp: Date.now(),
+    type: "default",
+  };
+
+  let chatID: string = crypto.randomUUID();
+  try {
+    const bootstrapChat = await upstreamSessionBootstrap.createChat(
+      authToken,
+      bootstrapPayload,
+      "",
+    );
+    chatID = bootstrapChat.id || bootstrapChat.chat?.id || chatID;
+    debugLog("CAPTCHA 重试已重建上游 chat: chat_id=%s", chatID);
+  } catch (error) {
+    debugLog("CAPTCHA 重试重建上游 chat 失败，回退随机 chat_id: %v", error);
+  }
+
+  return {
+    chatID,
+    upstreamReq: {
+      ...upstreamReq,
+      chat_id: chatID,
+      id: assistantPlaceholderID,
+      current_user_message_id: currentUserMessageID,
+      current_user_message_parent_id: currentUserMessageParentID,
+      captcha_verify_param: undefined,
+      extra: {
+        ...(upstreamReq.extra || {}),
+        __captcha_retry_attempted: true,
+        __captcha_retry_rebuilt_chat: true,
+      },
+    },
+  };
 }
 
 async function getFreshCaptchaPayload(
   authToken: string,
   refererChatID = "",
 ): Promise<Record<string, unknown> | null> {
+  const captchaFetchStartedAt = perfNow();
   const dedupeKey = `${authToken || "anonymous"}:${refererChatID}`;
   const pending = pendingCaptchaFetches.get(dedupeKey);
   if (pending) {
+    debugLog("captcha 获取复用 pending promise: key=%s", dedupeKey);
     return await pending;
   }
 
   const job = (async () => {
-    captchaSessionState.lastWorkerAttemptAt = Date.now();
+    const state = getOrCreateCaptchaSessionState(authToken);
+    state.lastWorkerAttemptAt = Date.now();
     let lastError: unknown = null;
 
     let sessionCookieHeader = "";
     try {
-      const session = await upstreamSessionBootstrap.ensureSession(authToken, refererChatID);
+      const sessionBootstrapStartedAt = perfNow();
+      const session = await upstreamSessionBootstrap.ensureSession(
+        authToken,
+        refererChatID,
+      );
+      debugCaptchaStageDuration(
+        "session-bootstrap",
+        sessionBootstrapStartedAt,
+        `chat_id=${refererChatID}`,
+      );
       sessionCookieHeader = session.cookieHeader || "";
       debugLog(
         "captcha worker session 已准备: refererChatID=%s cookie_keys=%s",
         refererChatID,
-        sessionCookieHeader ? listCookieKeysFromHeader(sessionCookieHeader).join(",") : "",
+        sessionCookieHeader
+          ? listCookieKeysFromHeader(sessionCookieHeader).join(",")
+          : "",
       );
     } catch (sessionError) {
       debugLog("captcha 前置 session bootstrap 失败: %v", sessionError);
+      debugCaptchaStageDuration(
+        "session-bootstrap.failed",
+        captchaFetchStartedAt,
+        `chat_id=${refererChatID}`,
+      );
     }
 
     const workerOptions: Record<string, unknown> = {
@@ -1987,11 +4143,17 @@ async function getFreshCaptchaPayload(
         prefix: "no8xfe",
       },
       requestUrlRewriteMap: {
-        "https://no8xfe.captcha-open.aliyuncs.com/": "https://no8xfe.captcha-open-southeast.aliyuncs.com/",
-        "https://upload.captcha-open.aliyuncs.com/": "https://upload.captcha-open-southeast.aliyuncs.com/",
+        "https://no8xfe.captcha-open.aliyuncs.com/":
+          "https://no8xfe.captcha-open-southeast.aliyuncs.com/",
+        "https://upload.captcha-open.aliyuncs.com/":
+          "https://upload.captcha-open-southeast.aliyuncs.com/",
       },
-      locationHref: refererChatID ? `${ORIGIN_BASE}/c/${refererChatID}` : ORIGIN_BASE,
-      referrer: refererChatID ? `${ORIGIN_BASE}/c/${refererChatID}` : `${ORIGIN_BASE}/`,
+      locationHref: refererChatID
+        ? `${ORIGIN_BASE}/c/${refererChatID}`
+        : ORIGIN_BASE,
+      referrer: refererChatID
+        ? `${ORIGIN_BASE}/c/${refererChatID}`
+        : `${ORIGIN_BASE}/`,
       localStorageSeed: {
         token: authToken,
       },
@@ -2035,7 +4197,8 @@ async function getFreshCaptchaPayload(
       workerOptions.cookieSeed = cookieHeaderToObject(sessionCookieHeader);
     }
     if (IMPORTED_BROWSER_CAPTURE_LATEST_CERTIFY_ID) {
-      workerOptions.fallbackCertifyId = IMPORTED_BROWSER_CAPTURE_LATEST_CERTIFY_ID;
+      workerOptions.fallbackCertifyId =
+        IMPORTED_BROWSER_CAPTURE_LATEST_CERTIFY_ID;
     }
     debugLog(
       "captcha worker options: hasCookie=%s fallbackCertifyId=%s ua=%s lang=%s tz=%s viewport=%sx%s",
@@ -2051,19 +4214,48 @@ async function getFreshCaptchaPayload(
     for (let attempt = 1; attempt <= 2; attempt++) {
       let shouldResetWorker = false;
       try {
-        const payload = await pureCodeWorkerBridge.fetchCaptchaPayload(authToken, workerOptions);
-        const captchaVerifyParam = typeof payload?.captcha_verify_param === "string"
-          ? payload.captcha_verify_param
-          : null;
+        const workerAttemptStartedAt = perfNow();
+        const payload = await pureCodeWorkerBridge.fetchCaptchaPayload(
+          authToken,
+          workerOptions,
+        );
+        debugCaptchaStageDuration(
+          `worker.attempt${attempt}`,
+          workerAttemptStartedAt,
+          `chat_id=${refererChatID}`,
+        );
+        const captchaVerifyParam =
+          typeof payload?.captcha_verify_param === "string"
+            ? payload.captcha_verify_param
+            : null;
         if (captchaVerifyParam) {
+          debugCaptchaStageDuration(
+            "fetch.total",
+            captchaFetchStartedAt,
+            `chat_id=${refererChatID} attempt=${attempt} source=${
+              typeof payload?.source === "string" ? payload.source : ""
+            }`,
+          );
           return payload;
         }
         lastError = new Error(`empty captcha payload on attempt ${attempt}`);
-        debugLog("pure-code worker 未返回 captcha_verify_param，准备重试: attempt=%d", attempt);
+        debugLog(
+          "pure-code worker 未返回 captcha_verify_param，准备重试: attempt=%d",
+          attempt,
+        );
       } catch (error) {
         lastError = error;
         shouldResetWorker = true;
-        debugLog("pure-code worker 获取 captcha 失败，准备重试: attempt=%d error=%s", attempt, String(error));
+        debugCaptchaStageDuration(
+          `worker.attempt${attempt}.failed`,
+          captchaFetchStartedAt,
+          `chat_id=${refererChatID}`,
+        );
+        debugLog(
+          "pure-code worker 获取 captcha 失败，准备重试: attempt=%d error=%s",
+          attempt,
+          String(error),
+        );
       }
 
       if (attempt === 1 && shouldResetWorker) {
@@ -2072,8 +4264,18 @@ async function getFreshCaptchaPayload(
     }
 
     if (lastError) {
+      debugCaptchaStageDuration(
+        "fetch.failed",
+        captchaFetchStartedAt,
+        `chat_id=${refererChatID}`,
+      );
       throw lastError;
     }
+    debugCaptchaStageDuration(
+      "fetch.empty",
+      captchaFetchStartedAt,
+      `chat_id=${refererChatID}`,
+    );
     return null;
   })();
 
@@ -2125,7 +4327,10 @@ class ImageProcessor {
   /**
    * 上传图像到 Z.AI 服务器
    */
-  static async uploadImage(imageUrl: string, token: string): Promise<UploadedFile | null> {
+  static async uploadImage(
+    imageUrl: string,
+    token: string,
+  ): Promise<UploadedFile | null> {
     try {
       debugLog("开始上传图像: %s", imageUrl.substring(0, 50) + "...");
 
@@ -2144,7 +4349,7 @@ class ImageProcessor {
         mimeType = `image/${matches[1]}`;
         filename = `image.${matches[1]}`;
         const base64Data = matches[2];
-        imageData = Uint8Array.from(atob(base64Data), c => c.charCodeAt(0));
+        imageData = Uint8Array.from(atob(base64Data), (c) => c.charCodeAt(0));
       } else if (imageUrl.startsWith("http")) {
         // 下载远程图像
         const response = await fetch(imageUrl);
@@ -2152,7 +4357,8 @@ class ImageProcessor {
           throw new Error(`Failed to download image: ${response.statusText}`);
         }
 
-        const contentType = response.headers.get("content-type") || "image/jpeg";
+        const contentType = response.headers.get("content-type") ||
+          "image/jpeg";
         const extension = contentType.split("/")[1] || "jpg";
         filename = `image.${extension}`;
 
@@ -2165,7 +4371,10 @@ class ImageProcessor {
 
       // 创建 FormData
       const formData = new FormData();
-      const arrayBuffer = imageData.buffer.slice(imageData.byteOffset, imageData.byteOffset + imageData.byteLength) as ArrayBuffer;
+      const arrayBuffer = imageData.buffer.slice(
+        imageData.byteOffset,
+        imageData.byteOffset + imageData.byteLength,
+      ) as ArrayBuffer;
       const blob = new Blob([arrayBuffer], { type: mimeType });
       formData.append("file", blob, filename);
 
@@ -2206,8 +4415,14 @@ class ImageProcessor {
   static async processImages(
     messages: Message[],
     token: string,
-    isVisionModel: boolean = false
-  ): Promise<{ processedMessages: Message[], uploadedFiles: UploadedFile[], uploadedFilesMap: Map<string, UploadedFile> }> {
+    isVisionModel: boolean = false,
+  ): Promise<
+    {
+      processedMessages: Message[];
+      uploadedFiles: UploadedFile[];
+      uploadedFilesMap: Map<string, UploadedFile>;
+    }
+  > {
     const processedMessages: Message[] = [];
     const uploadedFiles: UploadedFile[] = [];
     const uploadedFilesMap = new Map<string, UploadedFile>();
@@ -2231,10 +4446,14 @@ class ImageProcessor {
                 const newUrl = `${uploadedFile.id}_${uploadedFile.filename}`;
                 newContent.push({
                   type: "image_url",
-                  image_url: { url: newUrl }
+                  image_url: { url: newUrl },
                 });
                 uploadedFilesMap.set(imageUrl, uploadedFile);
-                debugLog("GLM-4.5V 图像 URL 已转换: %s -> %s", imageUrl.substring(0, 50), newUrl);
+                debugLog(
+                  "GLM-4.5V 图像 URL 已转换: %s -> %s",
+                  imageUrl.substring(0, 50),
+                  newUrl,
+                );
               } else {
                 // 非视觉模型: 添加到文件列表，从消息中移除
                 uploadedFiles.push(uploadedFile);
@@ -2262,7 +4481,7 @@ class ImageProcessor {
     return {
       processedMessages,
       uploadedFiles,
-      uploadedFilesMap
+      uploadedFilesMap,
     };
   }
 
@@ -2293,16 +4512,90 @@ class ImageProcessor {
  * 工具函数
  */
 
+function stringifyDebugArg(value: unknown): string {
+  if (value instanceof Error) {
+    return value.stack || value.message;
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  if (value === null || value === undefined) {
+    return String(value);
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function formatDebugMessage(format: string, args: unknown[]): string {
+  let argIndex = 0;
+  const message = format.replace(/%([sdifvoj%])/g, (match, type) => {
+    if (type === "%") {
+      return "%";
+    }
+    if (argIndex >= args.length) {
+      return match;
+    }
+
+    const value = args[argIndex++];
+    if (type === "d" || type === "i") {
+      return String(Number(value));
+    }
+    if (type === "f") {
+      return String(Number(value));
+    }
+    return stringifyDebugArg(value);
+  });
+
+  const rest = args.slice(argIndex).map(stringifyDebugArg);
+  return rest.length ? `${message} ${rest.join(" ")}` : message;
+}
+
 function debugLog(format: string, ...args: unknown[]): void {
   if (DEBUG_MODE) {
-    console.log(`[DEBUG] ${format}`, ...args);
+    console.log(`[DEBUG] ${formatDebugMessage(format, args)}`);
   }
+}
+
+function perfNow(): number {
+  return Date.now();
+}
+
+function debugStageDuration(
+  stage: string,
+  startedAt: number,
+  extra = "",
+): void {
+  if (!DEBUG_MODE) {
+    return;
+  }
+  const suffix = extra ? ` ${extra}` : "";
+  console.log(`[DEBUG] [perf] ${stage}=${Date.now() - startedAt}ms${suffix}`);
+}
+
+function debugCaptchaStageDuration(
+  stage: string,
+  startedAt: number,
+  extra = "",
+): void {
+  if (!DEBUG_MODE) {
+    return;
+  }
+  const suffix = extra ? ` ${extra}` : "";
+  console.log(
+    `[DEBUG] [captcha-perf] ${stage}=${Date.now() - startedAt}ms${suffix}`,
+  );
 }
 
 function recordRequestStats(
   startTime: number,
   path: string,
-  status: number
+  status: number,
 ): void {
   const duration = Date.now() - startTime;
 
@@ -2331,7 +4624,7 @@ function addLiveRequest(
   status: number,
   duration: number,
   userAgent: string,
-  model?: string
+  model?: string,
 ): void {
   const request: LiveRequest = {
     id: Date.now().toString(),
@@ -2436,9 +4729,12 @@ function setCORSHeaders(headers: Headers): void {
   headers.set("Access-Control-Allow-Origin", "*");
   headers.set(
     "Access-Control-Allow-Methods",
-    "GET, POST, PUT, DELETE, OPTIONS"
+    "GET, POST, PUT, DELETE, OPTIONS",
   );
-  headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  headers.set(
+    "Access-Control-Allow-Headers",
+    `Content-Type, Authorization, ${UPSTREAM_EXPLICIT_CONVERSATION_HEADER}`,
+  );
   headers.set("Access-Control-Allow-Credentials", "true");
 }
 
@@ -2448,7 +4744,9 @@ function validateApiKey(authHeader: string | null): boolean {
   }
 
   const apiKey = authHeader.substring(7);
-  return apiKey === DEFAULT_KEY;
+  // 吸收 ds2api 的直连 Token 模式 (Direct Token Mode)：
+  // 允许使用本地配置的 DEFAULT_KEY，或者长度大于 20 的任意有效 Z.ai 令牌直接验证通过。
+  return apiKey === DEFAULT_KEY || apiKey.length > 20;
 }
 
 function mergeSetCookieHeader(
@@ -2456,7 +4754,10 @@ function mergeSetCookieHeader(
   setCookieHeader: string | null,
 ): string {
   const jar = new Map<string, string>();
-  for (const part of existingCookieHeader.split(";").map((item) => item.trim()).filter(Boolean)) {
+  for (
+    const part of existingCookieHeader.split(";").map((item) => item.trim())
+      .filter(Boolean)
+  ) {
     const eq = part.indexOf("=");
     if (eq === -1) continue;
     jar.set(part.slice(0, eq), part.slice(eq + 1));
@@ -2484,6 +4785,75 @@ function maskToken(token: string): string {
   return `${token.slice(0, 12)}...${token.slice(-12)}`;
 }
 
+function redactSensitiveString(value: string): string {
+  let redacted = value.replace(
+    /eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g,
+    (token) => maskToken(token),
+  );
+  redacted = redacted.replace(
+    /(Bearer\s+)([^\s"']+)/gi,
+    (_match, prefix: string, token: string) => `${prefix}${maskToken(token)}`,
+  );
+  return redacted;
+}
+
+function redactSensitiveValue(key: string, value: unknown): unknown {
+  const lowerKey = key.toLowerCase();
+  const sensitiveKey = lowerKey.includes("token") ||
+    lowerKey.includes("authorization") ||
+    lowerKey.includes("cookie") ||
+    lowerKey.includes("captcha") ||
+    lowerKey.includes("signature");
+
+  if (typeof value === "string") {
+    if (!value) return value;
+    if (sensitiveKey) {
+      return lowerKey.includes("cookie")
+        ? summarizeCookieHeader(value)
+        : maskToken(value);
+    }
+    return redactSensitiveString(value);
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => redactSensitiveValue(key, item));
+  }
+  if (value && typeof value === "object") {
+    const output: Record<string, unknown> = {};
+    for (const [childKey, childValue] of Object.entries(value)) {
+      output[childKey] = redactSensitiveValue(childKey, childValue);
+    }
+    return output;
+  }
+  return value;
+}
+
+function redactJsonForLog(value: unknown): string {
+  try {
+    return JSON.stringify(redactSensitiveValue("", value));
+  } catch {
+    return "[unserializable]";
+  }
+}
+
+function redactUrlForLog(rawUrl: string): string {
+  try {
+    const url = new URL(rawUrl);
+    for (const key of Array.from(url.searchParams.keys())) {
+      const lowerKey = key.toLowerCase();
+      if (
+        lowerKey.includes("token") || lowerKey.includes("signature") ||
+        lowerKey.includes("captcha")
+      ) {
+        const val = url.searchParams.get(key) || "";
+        url.searchParams.set(key, maskToken(val));
+      }
+    }
+    return redactSensitiveString(url.toString());
+  } catch {
+    return redactSensitiveString(rawUrl);
+  }
+}
+
 function summarizeCookieHeader(cookieHeader: string): string {
   if (!cookieHeader) return "";
   return cookieHeader
@@ -2499,7 +4869,10 @@ function mergeCookieHeaderValue(
   cookieHeader: string | null | undefined,
 ): string {
   const jar = new Map<string, string>();
-  for (const part of existingCookieHeader.split(";").map((item) => item.trim()).filter(Boolean)) {
+  for (
+    const part of existingCookieHeader.split(";").map((item) => item.trim())
+      .filter(Boolean)
+  ) {
     const eq = part.indexOf("=");
     if (eq === -1) continue;
     jar.set(part.slice(0, eq), part.slice(eq + 1));
@@ -2507,7 +4880,11 @@ function mergeCookieHeaderValue(
   if (!cookieHeader) {
     return Array.from(jar.entries()).map(([k, v]) => `${k}=${v}`).join("; ");
   }
-  for (const part of cookieHeader.split(";").map((item) => item.trim()).filter(Boolean)) {
+  for (
+    const part of cookieHeader.split(";").map((item) => item.trim()).filter(
+      Boolean,
+    )
+  ) {
     const eq = part.indexOf("=");
     if (eq === -1) continue;
     jar.set(part.slice(0, eq), part.slice(eq + 1));
@@ -2515,7 +4892,9 @@ function mergeCookieHeaderValue(
   return Array.from(jar.entries()).map(([k, v]) => `${k}=${v}`).join("; ");
 }
 
-function mergeCookieHeaders(...cookieHeaders: Array<string | null | undefined>): string {
+function mergeCookieHeaders(
+  ...cookieHeaders: Array<string | null | undefined>
+): string {
   let merged = "";
   for (const cookieHeader of cookieHeaders) {
     if (!cookieHeader) continue;
@@ -2527,7 +4906,11 @@ function mergeCookieHeaders(...cookieHeaders: Array<string | null | undefined>):
 function cookieHeaderToObject(cookieHeader: string): Record<string, string> {
   const jar: Record<string, string> = {};
   if (!cookieHeader) return jar;
-  for (const part of cookieHeader.split(";").map((item) => item.trim()).filter(Boolean)) {
+  for (
+    const part of cookieHeader.split(";").map((item) => item.trim()).filter(
+      Boolean,
+    )
+  ) {
     const eq = part.indexOf("=");
     if (eq === -1) continue;
     const key = part.slice(0, eq).trim();
@@ -2556,7 +4939,8 @@ const IMPORTED_BROWSER_COOKIE_ALLOWLIST = new Set([
 ]);
 
 const STRICT_IMPORTED_BROWSER_COOKIE_ALLOWLIST =
-  (Deno.env.get("UPSTREAM_BROWSER_COOKIE_STRICT_ALLOWLIST") || "").trim().toLowerCase() === "true";
+  (Deno.env.get("UPSTREAM_BROWSER_COOKIE_STRICT_ALLOWLIST") || "").trim()
+    .toLowerCase() === "true";
 
 interface BrowserCaptureState {
   cookieHeader: string;
@@ -2572,7 +4956,10 @@ interface BrowserCaptureState {
 function sanitizeCapturedCertifyId(value: unknown): string {
   if (typeof value !== "string") return "";
   const trimmed = value.trim();
-  if (!trimmed || trimmed === "null" || trimmed === "undefined" || isRedactedCaptureValue(trimmed)) {
+  if (
+    !trimmed || trimmed === "null" || trimmed === "undefined" ||
+    isRedactedCaptureValue(trimmed)
+  ) {
     return "";
   }
   return trimmed;
@@ -2582,7 +4969,16 @@ function pickLatestCertifyIdFromCaptureRecord(input: unknown): string {
   const seen: string[] = [];
 
   const collectFromPlainObject = (record: Record<string, unknown>) => {
-    for (const key of ["CertifyId", "certifyId", "UserCertifyId", "userCertifyId", "cid", "cId"]) {
+    for (
+      const key of [
+        "CertifyId",
+        "certifyId",
+        "UserCertifyId",
+        "userCertifyId",
+        "cid",
+        "cId",
+      ]
+    ) {
       const value = sanitizeCapturedCertifyId(record[key]);
       if (value) seen.push(value);
     }
@@ -2597,14 +4993,25 @@ function pickLatestCertifyIdFromCaptureRecord(input: unknown): string {
     if (!postData || !postData.includes("=")) return;
     try {
       const params = new URLSearchParams(postData);
-      for (const key of ["CertifyId", "certifyId", "UserCertifyId", "userCertifyId", "cid", "cId"]) {
+      for (
+        const key of [
+          "CertifyId",
+          "certifyId",
+          "UserCertifyId",
+          "userCertifyId",
+          "cid",
+          "cId",
+        ]
+      ) {
         const value = sanitizeCapturedCertifyId(params.get(key));
         if (value) seen.push(value);
       }
       const captchaVerifyParam = params.get("CaptchaVerifyParam");
       if (captchaVerifyParam) {
         try {
-          collectFromPlainObject(JSON.parse(captchaVerifyParam) as Record<string, unknown>);
+          collectFromPlainObject(
+            JSON.parse(captchaVerifyParam) as Record<string, unknown>,
+          );
         } catch {
           // ignore malformed embedded captcha payloads
         }
@@ -2633,8 +5040,12 @@ function pickLatestCertifyIdFromCaptureRecord(input: unknown): string {
     const record = value as Record<string, unknown>;
     collectFromPlainObject(record);
     collectFromRequestLike(record);
-    if (typeof record.responseBody === "string") collectFromJsonBody(record.responseBody);
-    if (typeof record.body === "string" && record.type === "response_body") collectFromJsonBody(record.body);
+    if (typeof record.responseBody === "string") {
+      collectFromJsonBody(record.responseBody);
+    }
+    if (typeof record.body === "string" && record.type === "response_body") {
+      collectFromJsonBody(record.body);
+    }
     const response = record.response && typeof record.response === "object"
       ? record.response as Record<string, unknown>
       : null;
@@ -2685,19 +5096,28 @@ function isRedactedCaptureValue(value: string): boolean {
   const normalized = value.trim();
   if (!normalized) return true;
   if (/^\[(redacted|masked)\]$/i.test(normalized)) return true;
-  if (normalized.includes("[REDACTED]") || normalized.includes("[TRUNCATED]")) return true;
+  if (normalized.includes("[REDACTED]") || normalized.includes("[TRUNCATED]")) {
+    return true;
+  }
   return false;
 }
 
 function filterCookieHeaderByAllowlist(cookieHeader: string): string {
   if (!cookieHeader) return "";
   const jar = new Map<string, string>();
-  for (const part of cookieHeader.split(";").map((item) => item.trim()).filter(Boolean)) {
+  for (
+    const part of cookieHeader.split(";").map((item) => item.trim()).filter(
+      Boolean,
+    )
+  ) {
     const eq = part.indexOf("=");
     if (eq === -1) continue;
     const key = part.slice(0, eq).trim();
     if (!key) continue;
-    if (STRICT_IMPORTED_BROWSER_COOKIE_ALLOWLIST && !IMPORTED_BROWSER_COOKIE_ALLOWLIST.has(key)) {
+    if (
+      STRICT_IMPORTED_BROWSER_COOKIE_ALLOWLIST &&
+      !IMPORTED_BROWSER_COOKIE_ALLOWLIST.has(key)
+    ) {
       continue;
     }
     jar.set(key, part.slice(eq + 1));
@@ -2707,7 +5127,11 @@ function filterCookieHeaderByAllowlist(cookieHeader: string): string {
 
 function extractTokenFromCookieHeader(cookieHeader: string): string {
   if (!cookieHeader) return "";
-  for (const part of cookieHeader.split(";").map((item) => item.trim()).filter(Boolean)) {
+  for (
+    const part of cookieHeader.split(";").map((item) => item.trim()).filter(
+      Boolean,
+    )
+  ) {
     const eq = part.indexOf("=");
     if (eq === -1) continue;
     const key = part.slice(0, eq).trim().toLowerCase();
@@ -2721,7 +5145,10 @@ function extractCookieHeaderFromUnknownCapture(input: unknown): string {
   if (!input || typeof input !== "object") return "";
   const record = input as Record<string, unknown>;
   const directCookie = typeof record.cookie === "string" ? record.cookie : "";
-  if (directCookie && !isRedactedCaptureValue(directCookie) && directCookie.includes("=")) {
+  if (
+    directCookie && !isRedactedCaptureValue(directCookie) &&
+    directCookie.includes("=")
+  ) {
     return directCookie;
   }
   const state = record.state && typeof record.state === "object"
@@ -2744,13 +5171,17 @@ function extractCookieHeaderFromUnknownCapture(input: unknown): string {
       : typeof normalizedHeaders.cookie === "string"
       ? normalizedHeaders.cookie
       : "";
-    if (fromHeaders && !isRedactedCaptureValue(fromHeaders) && fromHeaders.includes("=")) {
+    if (
+      fromHeaders && !isRedactedCaptureValue(fromHeaders) &&
+      fromHeaders.includes("=")
+    ) {
       return fromHeaders;
     }
   }
-  const requestHeaders = record.requestHeaders && typeof record.requestHeaders === "object"
-    ? record.requestHeaders as Record<string, unknown>
-    : null;
+  const requestHeaders =
+    record.requestHeaders && typeof record.requestHeaders === "object"
+      ? record.requestHeaders as Record<string, unknown>
+      : null;
   if (requestHeaders) {
     const normalizedHeaders = headersToObject(requestHeaders);
     const fromRequestHeaders = typeof normalizedHeaders.Cookie === "string"
@@ -2758,7 +5189,10 @@ function extractCookieHeaderFromUnknownCapture(input: unknown): string {
       : typeof normalizedHeaders.cookie === "string"
       ? normalizedHeaders.cookie
       : "";
-    if (fromRequestHeaders && !isRedactedCaptureValue(fromRequestHeaders) && fromRequestHeaders.includes("=")) {
+    if (
+      fromRequestHeaders && !isRedactedCaptureValue(fromRequestHeaders) &&
+      fromRequestHeaders.includes("=")
+    ) {
       return fromRequestHeaders;
     }
   }
@@ -2772,7 +5206,10 @@ function extractCookieHeaderFromUnknownCapture(input: unknown): string {
       : typeof normalizedHeaders.cookie === "string"
       ? normalizedHeaders.cookie
       : "";
-    if (fromRequestHeaders && !isRedactedCaptureValue(fromRequestHeaders) && fromRequestHeaders.includes("=")) {
+    if (
+      fromRequestHeaders && !isRedactedCaptureValue(fromRequestHeaders) &&
+      fromRequestHeaders.includes("=")
+    ) {
       return fromRequestHeaders;
     }
   }
@@ -2802,7 +5239,9 @@ function headersToObject(input: unknown): Record<string, string> {
 function extractTokenFromUnknownCapture(input: unknown): string {
   if (!input || typeof input !== "object") return "";
   const record = input as Record<string, unknown>;
-  const directToken = typeof record.token === "string" ? record.token.trim() : "";
+  const directToken = typeof record.token === "string"
+    ? record.token.trim()
+    : "";
   if (directToken && !isRedactedCaptureValue(directToken)) {
     return directToken;
   }
@@ -2810,17 +5249,22 @@ function extractTokenFromUnknownCapture(input: unknown): string {
     ? record.state as Record<string, unknown>
     : null;
   if (
-    state && typeof state.localStorageToken === "string" && state.localStorageToken.trim() &&
+    state && typeof state.localStorageToken === "string" &&
+    state.localStorageToken.trim() &&
     !isRedactedCaptureValue(state.localStorageToken)
   ) {
     return state.localStorageToken.trim();
   }
-  if (state && typeof state.token === "string" && state.token.trim() && !isRedactedCaptureValue(state.token)) {
+  if (
+    state && typeof state.token === "string" && state.token.trim() &&
+    !isRedactedCaptureValue(state.token)
+  ) {
     return state.token.trim();
   }
-  const requestHeaders = record.requestHeaders && typeof record.requestHeaders === "object"
-    ? record.requestHeaders as Record<string, unknown>
-    : null;
+  const requestHeaders =
+    record.requestHeaders && typeof record.requestHeaders === "object"
+      ? record.requestHeaders as Record<string, unknown>
+      : null;
   if (requestHeaders) {
     const normalizedHeaders = headersToObject(requestHeaders);
     const authHeader = typeof normalizedHeaders.Authorization === "string"
@@ -2828,7 +5272,10 @@ function extractTokenFromUnknownCapture(input: unknown): string {
       : typeof normalizedHeaders.authorization === "string"
       ? normalizedHeaders.authorization
       : "";
-    if (!isRedactedCaptureValue(authHeader) && authHeader.toLowerCase().startsWith("bearer ")) {
+    if (
+      !isRedactedCaptureValue(authHeader) &&
+      authHeader.toLowerCase().startsWith("bearer ")
+    ) {
       return authHeader.slice(7).trim();
     }
     const cookieHeader = typeof normalizedHeaders.Cookie === "string"
@@ -2851,7 +5298,10 @@ function extractTokenFromUnknownCapture(input: unknown): string {
       : typeof normalizedHeaders.authorization === "string"
       ? normalizedHeaders.authorization
       : "";
-    if (!isRedactedCaptureValue(authHeader) && authHeader.toLowerCase().startsWith("bearer ")) {
+    if (
+      !isRedactedCaptureValue(authHeader) &&
+      authHeader.toLowerCase().startsWith("bearer ")
+    ) {
       return authHeader.slice(7).trim();
     }
   }
@@ -2865,42 +5315,54 @@ function extractTokenFromUnknownCapture(input: unknown): string {
       : typeof normalizedHeaders.authorization === "string"
       ? normalizedHeaders.authorization
       : "";
-    if (!isRedactedCaptureValue(authHeader) && authHeader.toLowerCase().startsWith("bearer ")) {
+    if (
+      !isRedactedCaptureValue(authHeader) &&
+      authHeader.toLowerCase().startsWith("bearer ")
+    ) {
       return authHeader.slice(7).trim();
     }
   }
-  return extractTokenFromCookieHeader(extractCookieHeaderFromUnknownCapture(record));
+  return extractTokenFromCookieHeader(
+    extractCookieHeaderFromUnknownCapture(record),
+  );
 }
 
-function extractProfileFromUnknownCapture(input: unknown): Partial<BrowserCaptureState> {
+function extractProfileFromUnknownCapture(
+  input: unknown,
+): Partial<BrowserCaptureState> {
   if (!input || typeof input !== "object") return {};
   const record = input as Record<string, unknown>;
   const state = record.state && typeof record.state === "object"
     ? record.state as Record<string, unknown>
     : null;
-  const localStorageToken = state && typeof state.localStorageToken === "string" &&
+  const localStorageToken =
+    state && typeof state.localStorageToken === "string" &&
       !isRedactedCaptureValue(state.localStorageToken)
-    ? state.localStorageToken.trim()
-    : "";
-  const pageTitle = state && typeof state.title === "string" && !isRedactedCaptureValue(state.title)
+      ? state.localStorageToken.trim()
+      : "";
+  const pageTitle = state && typeof state.title === "string" &&
+      !isRedactedCaptureValue(state.title)
     ? state.title.trim()
     : "";
-  const pageHref = state && typeof state.href === "string" && !isRedactedCaptureValue(state.href)
+  const pageHref = state && typeof state.href === "string" &&
+      !isRedactedCaptureValue(state.href)
     ? state.href.trim()
     : "";
-  const stateProfile: Partial<BrowserCaptureState> = localStorageToken || pageTitle || pageHref
-    ? {
-      ...(localStorageToken ? { token: localStorageToken } : {}),
-      ...(pageTitle ? { profileName: pageTitle } : {}),
-      ...(pageHref ? { profileEmail: pageHref } : {}),
-    }
-    : {};
+  const stateProfile: Partial<BrowserCaptureState> =
+    localStorageToken || pageTitle || pageHref
+      ? {
+        ...(localStorageToken ? { token: localStorageToken } : {}),
+        ...(pageTitle ? { profileName: pageTitle } : {}),
+        ...(pageHref ? { profileEmail: pageHref } : {}),
+      }
+      : {};
   const responseRecord = record.response && typeof record.response === "object"
     ? record.response as Record<string, unknown>
     : null;
-  const responseContent = responseRecord?.content && typeof responseRecord.content === "object"
-    ? responseRecord.content as Record<string, unknown>
-    : null;
+  const responseContent =
+    responseRecord?.content && typeof responseRecord.content === "object"
+      ? responseRecord.content as Record<string, unknown>
+      : null;
   const responseBody = typeof record.responseBody === "string"
     ? record.responseBody.trim()
     : typeof record.responseBodySummary === "string"
@@ -2913,9 +5375,10 @@ function extractProfileFromUnknownCapture(input: unknown): Partial<BrowserCaptur
   }
   try {
     const parsed = JSON.parse(responseBody) as Record<string, unknown>;
-    const token = typeof parsed.token === "string" && !isRedactedCaptureValue(parsed.token)
-      ? parsed.token
-      : "";
+    const token =
+      typeof parsed.token === "string" && !isRedactedCaptureValue(parsed.token)
+        ? parsed.token
+        : "";
     if (!token) {
       return stateProfile;
     }
@@ -2931,7 +5394,9 @@ function extractProfileFromUnknownCapture(input: unknown): Partial<BrowserCaptur
   }
 }
 
-function extractRequestProfileFromHeaders(headers: Record<string, string>): Partial<BrowserRequestProfile> {
+function extractRequestProfileFromHeaders(
+  headers: Record<string, string>,
+): Partial<BrowserRequestProfile> {
   const userAgent = typeof headers["User-Agent"] === "string"
     ? headers["User-Agent"]
     : typeof headers["user-agent"] === "string"
@@ -2959,23 +5424,33 @@ function extractRequestProfileFromHeaders(headers: Record<string, string>): Part
     : "";
   return {
     ...(userAgent && !isRedactedCaptureValue(userAgent) ? { userAgent } : {}),
-    ...(acceptLanguage && !isRedactedCaptureValue(acceptLanguage) ? { acceptLanguage } : {}),
+    ...(acceptLanguage && !isRedactedCaptureValue(acceptLanguage)
+      ? { acceptLanguage }
+      : {}),
     ...(secChUa && !isRedactedCaptureValue(secChUa) ? { secChUa } : {}),
-    ...(secChUaMobile && !isRedactedCaptureValue(secChUaMobile) ? { secChUaMobile } : {}),
-    ...(secChUaPlatform && !isRedactedCaptureValue(secChUaPlatform) ? { secChUaPlatform } : {}),
+    ...(secChUaMobile && !isRedactedCaptureValue(secChUaMobile)
+      ? { secChUaMobile }
+      : {}),
+    ...(secChUaPlatform && !isRedactedCaptureValue(secChUaPlatform)
+      ? { secChUaPlatform }
+      : {}),
   };
 }
 
-function extractFingerprintProfileFromUnknownCapture(input: unknown): Record<string, string> {
+function extractFingerprintProfileFromUnknownCapture(
+  input: unknown,
+): Record<string, string> {
   if (!input || typeof input !== "object") return {};
   const record = input as Record<string, unknown>;
   const state = record.state && typeof record.state === "object"
     ? record.state as Record<string, unknown>
     : null;
-  const stateHref = state && typeof state.href === "string" && !isRedactedCaptureValue(state.href)
+  const stateHref = state && typeof state.href === "string" &&
+      !isRedactedCaptureValue(state.href)
     ? state.href.trim()
     : "";
-  const stateTitle = state && typeof state.title === "string" && !isRedactedCaptureValue(state.title)
+  const stateTitle = state && typeof state.title === "string" &&
+      !isRedactedCaptureValue(state.title)
     ? state.title.trim()
     : "";
   const fromPageState: Record<string, string> = {};
@@ -3036,7 +5511,9 @@ function extractFingerprintProfileFromUnknownCapture(input: unknown): Record<str
   }
 }
 
-function mergeBrowserCaptureStates(...states: Array<Partial<BrowserCaptureState> | null | undefined>): BrowserCaptureState {
+function mergeBrowserCaptureStates(
+  ...states: Array<Partial<BrowserCaptureState> | null | undefined>
+): BrowserCaptureState {
   const merged: BrowserCaptureState = {
     cookieHeader: "",
     token: "",
@@ -3050,7 +5527,10 @@ function mergeBrowserCaptureStates(...states: Array<Partial<BrowserCaptureState>
   for (const state of states) {
     if (!state) continue;
     if (typeof state.cookieHeader === "string" && state.cookieHeader) {
-      merged.cookieHeader = mergeCookieHeaders(merged.cookieHeader, state.cookieHeader);
+      merged.cookieHeader = mergeCookieHeaders(
+        merged.cookieHeader,
+        state.cookieHeader,
+      );
     }
     if (typeof state.token === "string" && state.token) {
       merged.token = state.token;
@@ -3068,10 +5548,18 @@ function mergeBrowserCaptureStates(...states: Array<Partial<BrowserCaptureState>
       merged.profileRole = state.profileRole;
     }
     if (state.requestProfile && typeof state.requestProfile === "object") {
-      merged.requestProfile = { ...merged.requestProfile, ...state.requestProfile };
+      merged.requestProfile = {
+        ...merged.requestProfile,
+        ...state.requestProfile,
+      };
     }
-    if (state.fingerprintProfile && typeof state.fingerprintProfile === "object") {
-      merged.fingerprintProfile = { ...merged.fingerprintProfile, ...state.fingerprintProfile };
+    if (
+      state.fingerprintProfile && typeof state.fingerprintProfile === "object"
+    ) {
+      merged.fingerprintProfile = {
+        ...merged.fingerprintProfile,
+        ...state.fingerprintProfile,
+      };
     }
   }
   merged.cookieHeader = filterCookieHeaderByAllowlist(merged.cookieHeader);
@@ -3081,7 +5569,9 @@ function mergeBrowserCaptureStates(...states: Array<Partial<BrowserCaptureState>
   return merged;
 }
 
-function extractBrowserCaptureStateFromUnknownCapture(input: unknown): BrowserCaptureState {
+function extractBrowserCaptureStateFromUnknownCapture(
+  input: unknown,
+): BrowserCaptureState {
   if (!input || typeof input !== "object") {
     return { cookieHeader: "", token: "" };
   }
@@ -3089,13 +5579,19 @@ function extractBrowserCaptureStateFromUnknownCapture(input: unknown): BrowserCa
   const direct = mergeBrowserCaptureStates({
     cookieHeader: extractCookieHeaderFromUnknownCapture(record),
     token: extractTokenFromUnknownCapture(record),
-    requestProfile: extractRequestProfileFromHeaders(headersToObject(record.requestHeaders || record.headers)),
+    requestProfile: extractRequestProfileFromHeaders(
+      headersToObject(record.requestHeaders || record.headers),
+    ),
     fingerprintProfile: extractFingerprintProfileFromUnknownCapture(record),
   }, extractProfileFromUnknownCapture(record));
-  const requestDetails = Array.isArray(record.requestDetails) ? record.requestDetails : [];
-  const harEntries = Array.isArray((record.log && typeof record.log === "object"
-    ? (record.log as Record<string, unknown>).entries
-    : null))
+  const requestDetails = Array.isArray(record.requestDetails)
+    ? record.requestDetails
+    : [];
+  const harEntries = Array.isArray(
+      record.log && typeof record.log === "object"
+        ? (record.log as Record<string, unknown>).entries
+        : null,
+    )
     ? ((record.log as Record<string, unknown>).entries as unknown[])
     : [];
   const nested = requestDetails.map((item) =>
@@ -3103,12 +5599,20 @@ function extractBrowserCaptureStateFromUnknownCapture(input: unknown): BrowserCa
       cookieHeader: extractCookieHeaderFromUnknownCapture(item),
       token: extractTokenFromUnknownCapture(item),
       requestProfile: extractRequestProfileFromHeaders(headersToObject(
-        (item && typeof item === "object" ? (item as Record<string, unknown>).requestHeaders : null) ||
-        (item && typeof item === "object" ? (item as Record<string, unknown>).headers : null) ||
-        ((item && typeof item === "object" && (item as Record<string, unknown>).request &&
-          typeof (item as Record<string, unknown>).request === "object")
-          ? ((item as Record<string, unknown>).request as Record<string, unknown>).headers
-          : null),
+        (item && typeof item === "object"
+          ? (item as Record<string, unknown>).requestHeaders
+          : null) ||
+          (item && typeof item === "object"
+            ? (item as Record<string, unknown>).headers
+            : null) ||
+          ((item && typeof item === "object" &&
+              (item as Record<string, unknown>).request &&
+              typeof (item as Record<string, unknown>).request === "object")
+            ? ((item as Record<string, unknown>).request as Record<
+              string,
+              unknown
+            >).headers
+            : null),
       )),
       fingerprintProfile: extractFingerprintProfileFromUnknownCapture(item),
     }, extractProfileFromUnknownCapture(item))
@@ -3118,9 +5622,13 @@ function extractBrowserCaptureStateFromUnknownCapture(input: unknown): BrowserCa
       cookieHeader: extractCookieHeaderFromUnknownCapture(item),
       token: extractTokenFromUnknownCapture(item),
       requestProfile: extractRequestProfileFromHeaders(headersToObject(
-        (item && typeof item === "object" && (item as Record<string, unknown>).request &&
-          typeof (item as Record<string, unknown>).request === "object")
-          ? ((item as Record<string, unknown>).request as Record<string, unknown>).headers
+        (item && typeof item === "object" &&
+            (item as Record<string, unknown>).request &&
+            typeof (item as Record<string, unknown>).request === "object")
+          ? ((item as Record<string, unknown>).request as Record<
+            string,
+            unknown
+          >).headers
           : null,
       )),
       fingerprintProfile: extractFingerprintProfileFromUnknownCapture(item),
@@ -3129,7 +5637,9 @@ function extractBrowserCaptureStateFromUnknownCapture(input: unknown): BrowserCa
   return mergeBrowserCaptureStates(direct, ...nested, ...harStates);
 }
 
-async function loadBrowserCaptureState(path: string): Promise<BrowserCaptureState> {
+async function loadBrowserCaptureState(
+  path: string,
+): Promise<BrowserCaptureState> {
   if (!path) return { cookieHeader: "", token: "" };
   const capturePaths = await expandBrowserCapturePaths(path);
   const mergedStates: BrowserCaptureState[] = [];
@@ -3144,10 +5654,14 @@ async function loadBrowserCaptureState(path: string): Promise<BrowserCaptureStat
           const parsed = JSON.parse(trimmed);
           if (Array.isArray(parsed)) {
             for (const item of parsed) {
-              candidates.push(extractBrowserCaptureStateFromUnknownCapture(item));
+              candidates.push(
+                extractBrowserCaptureStateFromUnknownCapture(item),
+              );
             }
           } else {
-            candidates.push(extractBrowserCaptureStateFromUnknownCapture(parsed));
+            candidates.push(
+              extractBrowserCaptureStateFromUnknownCapture(parsed),
+            );
           }
         } catch {
           // Some capture files are JSONL that start with "{" but contain multiple JSON objects.
@@ -3156,7 +5670,9 @@ async function loadBrowserCaptureState(path: string): Promise<BrowserCaptureStat
             if (!text.startsWith("{")) continue;
             try {
               const parsed = JSON.parse(text);
-              candidates.push(extractBrowserCaptureStateFromUnknownCapture(parsed));
+              candidates.push(
+                extractBrowserCaptureStateFromUnknownCapture(parsed),
+              );
             } catch {
               // ignore malformed jsonl line
             }
@@ -3168,7 +5684,9 @@ async function loadBrowserCaptureState(path: string): Promise<BrowserCaptureStat
           if (!text.startsWith("{")) continue;
           try {
             const parsed = JSON.parse(text);
-            candidates.push(extractBrowserCaptureStateFromUnknownCapture(parsed));
+            candidates.push(
+              extractBrowserCaptureStateFromUnknownCapture(parsed),
+            );
           } catch {
             // ignore malformed jsonl line
           }
@@ -3188,7 +5706,11 @@ async function loadBrowserCaptureState(path: string): Promise<BrowserCaptureStat
         debugLog("浏览器捕获文件未提取到可用会话: path=%s", capturePath);
       }
     } catch (error) {
-      debugLog("加载浏览器捕获会话失败: path=%s error=%s", capturePath, String(error));
+      debugLog(
+        "加载浏览器捕获会话失败: path=%s error=%s",
+        capturePath,
+        String(error),
+      );
     }
   }
   const finalState = mergeBrowserCaptureStates(...mergedStates);
@@ -3198,7 +5720,9 @@ async function loadBrowserCaptureState(path: string): Promise<BrowserCaptureStat
   return finalState;
 }
 
-async function loadLatestBrowserCaptureCertifyId(path: string): Promise<string> {
+async function loadLatestBrowserCaptureCertifyId(
+  path: string,
+): Promise<string> {
   if (!path) return "";
   const capturePaths = await expandBrowserCapturePaths(path);
   let latestCertifyId = "";
@@ -3243,10 +5767,18 @@ async function loadLatestBrowserCaptureCertifyId(path: string): Promise<string> 
         if (certifyId) latestCertifyId = certifyId;
       }
       if (latestCertifyId) {
-        debugLog("已从浏览器捕获提取最新 CertifyId: path=%s certifyId=%s", capturePath, latestCertifyId);
+        debugLog(
+          "已从浏览器捕获提取最新 CertifyId: path=%s certifyId=%s",
+          capturePath,
+          latestCertifyId,
+        );
       }
     } catch (error) {
-      debugLog("提取浏览器捕获 CertifyId 失败: path=%s error=%s", capturePath, String(error));
+      debugLog(
+        "提取浏览器捕获 CertifyId 失败: path=%s error=%s",
+        capturePath,
+        String(error),
+      );
     }
   }
   return latestCertifyId;
@@ -3297,14 +5829,18 @@ async function hydrateBrowserCaptureStateViaAuths(
   }
   try {
     const headers = await SmartHeaderGenerator.generateHeaders("");
-    const response = await fetchWithCurlFallback(`${ORIGIN_BASE}/api/v1/auths/`, {
-      method: "GET",
-      headers: {
-        ...headers,
-        Accept: "*/*",
-        Cookie: state.cookieHeader,
+    const response = await fetchWithCurlFallback(
+      `${ORIGIN_BASE}/api/v1/auths/`,
+      {
+        method: "GET",
+        headers: {
+          ...headers,
+          Accept: "*/*",
+          Cookie: state.cookieHeader,
+        },
       },
-    }, "浏览器捕获会话补全 /api/v1/auths/");
+      "浏览器捕获会话补全 /api/v1/auths/",
+    );
     if (!response.ok) {
       debugLog(
         "浏览器捕获会话补全失败: /api/v1/auths/ status=%d cookies=%s",
@@ -3351,9 +5887,10 @@ async function hydrateBrowserCaptureStateViaAuths(
 const IMPORTED_BROWSER_CAPTURE_STATE = await hydrateBrowserCaptureStateViaAuths(
   await loadBrowserCaptureState(UPSTREAM_BROWSER_COOKIE_CAPTURE_PATH),
 );
-const IMPORTED_BROWSER_CAPTURE_LATEST_CERTIFY_ID = await loadLatestBrowserCaptureCertifyId(
-  UPSTREAM_BROWSER_COOKIE_CAPTURE_PATH,
-);
+const IMPORTED_BROWSER_CAPTURE_LATEST_CERTIFY_ID =
+  await loadLatestBrowserCaptureCertifyId(
+    UPSTREAM_BROWSER_COOKIE_CAPTURE_PATH,
+  );
 IMPORTED_BROWSER_REQUEST_PROFILE = {
   ...(IMPORTED_BROWSER_CAPTURE_STATE.requestProfile || {}),
 };
@@ -3366,17 +5903,25 @@ if (
 ) {
   debugLog(
     "已导入浏览器画像: ua=%s lang=%s tz=%s viewport=%sx%s",
-    IMPORTED_BROWSER_REQUEST_PROFILE.userAgent || IMPORTED_BROWSER_FINGERPRINT_PROFILE.user_agent || "",
-    IMPORTED_BROWSER_REQUEST_PROFILE.acceptLanguage || IMPORTED_BROWSER_FINGERPRINT_PROFILE.language || "",
+    IMPORTED_BROWSER_REQUEST_PROFILE.userAgent ||
+      IMPORTED_BROWSER_FINGERPRINT_PROFILE.user_agent || "",
+    IMPORTED_BROWSER_REQUEST_PROFILE.acceptLanguage ||
+      IMPORTED_BROWSER_FINGERPRINT_PROFILE.language || "",
     IMPORTED_BROWSER_FINGERPRINT_PROFILE.timezone || "",
     IMPORTED_BROWSER_FINGERPRINT_PROFILE.viewport_width || "",
     IMPORTED_BROWSER_FINGERPRINT_PROFILE.viewport_height || "",
   );
 }
 if (IMPORTED_BROWSER_CAPTURE_LATEST_CERTIFY_ID) {
-  debugLog("已导入浏览器捕获最新 CertifyId: %s", IMPORTED_BROWSER_CAPTURE_LATEST_CERTIFY_ID);
+  debugLog(
+    "已导入浏览器捕获最新 CertifyId: %s",
+    IMPORTED_BROWSER_CAPTURE_LATEST_CERTIFY_ID,
+  );
 }
-type UpstreamSessionMode = "anonymous_guest" | "logged_in_cookie" | "configured_token";
+type UpstreamSessionMode =
+  | "anonymous_guest"
+  | "logged_in_cookie"
+  | "configured_token";
 
 interface UpstreamBootstrapSession {
   mode: UpstreamSessionMode;
@@ -3400,7 +5945,10 @@ function isGuestRole(role: string | null | undefined): boolean {
   return String(role || "").trim().toLowerCase() === "guest";
 }
 
-function buildImportedSessionProfiles(): Pick<UpstreamBootstrapSession, "requestProfile" | "fingerprintProfile"> {
+function buildImportedSessionProfiles(): Pick<
+  UpstreamBootstrapSession,
+  "requestProfile" | "fingerprintProfile"
+> {
   return {
     requestProfile: { ...IMPORTED_BROWSER_REQUEST_PROFILE },
     fingerprintProfile: { ...IMPORTED_BROWSER_FINGERPRINT_PROFILE },
@@ -3412,7 +5960,10 @@ function buildImportedCaptureBootstrapSession(
   authTokenOverride = "",
   roleFallback = "",
 ): UpstreamBootstrapSession | null {
-  if (!IMPORTED_BROWSER_CAPTURE_STATE.cookieHeader && !IMPORTED_BROWSER_CAPTURE_STATE.token) {
+  if (
+    !IMPORTED_BROWSER_CAPTURE_STATE.cookieHeader &&
+    !IMPORTED_BROWSER_CAPTURE_STATE.token
+  ) {
     return null;
   }
   const importedToken = (IMPORTED_BROWSER_CAPTURE_STATE.token || "").trim();
@@ -3454,7 +6005,10 @@ function buildUpstreamBootstrapSession(
   const returnedAuthToken = parsed.token || authToken;
   return {
     mode,
-    cookieHeader: mergeCookieHeaders(cookieHeader, returnedAuthToken ? `token=${returnedAuthToken}` : ""),
+    cookieHeader: mergeCookieHeaders(
+      cookieHeader,
+      returnedAuthToken ? `token=${returnedAuthToken}` : "",
+    ),
     authToken,
     returnedAuthToken,
     profileId: parsed.id || "",
@@ -3466,7 +6020,9 @@ function buildUpstreamBootstrapSession(
   };
 }
 
-function findBootstrapSessionByToken(token: string): UpstreamBootstrapSession | null {
+function findBootstrapSessionByToken(
+  token: string,
+): UpstreamBootstrapSession | null {
   const candidates = [loggedInCookieBootstrapState, anonymousBootstrapState];
   for (const session of candidates) {
     if (!session) continue;
@@ -3478,7 +6034,10 @@ function findBootstrapSessionByToken(token: string): UpstreamBootstrapSession | 
 }
 
 async function bootstrapAnonymousSession(): Promise<UpstreamBootstrapSession> {
-  if (anonymousBootstrapState && (Date.now() - anonymousBootstrapState.updatedAt) <= 25 * 60 * 1000) {
+  if (
+    anonymousBootstrapState &&
+    (Date.now() - anonymousBootstrapState.updatedAt) <= 25 * 60 * 1000
+  ) {
     return anonymousBootstrapState;
   }
 
@@ -3497,7 +6056,8 @@ async function bootstrapAnonymousSession(): Promise<UpstreamBootstrapSession> {
       "匿名 bootstrap 使用导入 capture 作为种子: token=%s cookies=%s profile=%s",
       maskToken(importedAnonymousSession.authToken),
       summarizeCookieHeader(importedAnonymousSession.cookieHeader),
-      importedAnonymousSession.profileName || importedAnonymousSession.profileEmail || "",
+      importedAnonymousSession.profileName ||
+        importedAnonymousSession.profileEmail || "",
     );
   }
 
@@ -3506,7 +6066,8 @@ async function bootstrapAnonymousSession(): Promise<UpstreamBootstrapSession> {
       method: "GET",
       headers: {
         ...headers,
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         ...(cookieHeader ? { Cookie: cookieHeader } : {}),
       },
     });
@@ -3523,14 +6084,18 @@ async function bootstrapAnonymousSession(): Promise<UpstreamBootstrapSession> {
     debugLog("匿名 bootstrap: GET / 失败: %s", String(error));
   }
 
-  const authResponse = await fetchWithCurlFallback(`${ORIGIN_BASE}/api/v1/auths/`, {
-    method: "GET",
-    headers: {
-      ...headers,
-      Accept: "*/*",
-      ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+  const authResponse = await fetchWithCurlFallback(
+    `${ORIGIN_BASE}/api/v1/auths/`,
+    {
+      method: "GET",
+      headers: {
+        ...headers,
+        Accept: "*/*",
+        ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+      },
     },
-  }, "匿名 bootstrap /api/v1/auths/");
+    "匿名 bootstrap /api/v1/auths/",
+  );
   if (!authResponse.ok) {
     throw new Error(`anonymous auth bootstrap failed: ${authResponse.status}`);
   }
@@ -3555,7 +6120,11 @@ async function bootstrapAnonymousSession(): Promise<UpstreamBootstrapSession> {
     throw new Error("Anonymous token is empty");
   }
   if (!isGuestRole(parsed.role)) {
-    throw new Error(`Anonymous auth bootstrap returned non-guest role: ${parsed.role || "unknown"}`);
+    throw new Error(
+      `Anonymous auth bootstrap returned non-guest role: ${
+        parsed.role || "unknown"
+      }`,
+    );
   }
 
   anonymousBootstrapState = buildUpstreamBootstrapSession(
@@ -3573,11 +6142,16 @@ async function bootstrapAnonymousSession(): Promise<UpstreamBootstrapSession> {
   return anonymousBootstrapState;
 }
 
-async function bootstrapLoggedInCookieSession(): Promise<UpstreamBootstrapSession> {
+async function bootstrapLoggedInCookieSession(): Promise<
+  UpstreamBootstrapSession
+> {
   if (!UPSTREAM_LOGGED_IN_COOKIE_HEADER) {
     throw new Error("UPSTREAM_LOGGED_IN_COOKIE_HEADER is empty");
   }
-  if (loggedInCookieBootstrapState && (Date.now() - loggedInCookieBootstrapState.updatedAt) <= 25 * 60 * 1000) {
+  if (
+    loggedInCookieBootstrapState &&
+    (Date.now() - loggedInCookieBootstrapState.updatedAt) <= 25 * 60 * 1000
+  ) {
     return loggedInCookieBootstrapState;
   }
 
@@ -3595,7 +6169,9 @@ async function bootstrapLoggedInCookieSession(): Promise<UpstreamBootstrapSessio
     },
   }, "登录 bootstrap /api/v1/auths/");
   if (!response.ok) {
-    throw new Error(`logged-in cookie auth bootstrap failed: ${response.status}`);
+    throw new Error(
+      `logged-in cookie auth bootstrap failed: ${response.status}`,
+    );
   }
   cookieHeader = mergeCookieHeaders(
     cookieHeader,
@@ -3674,7 +6250,8 @@ class UpstreamSessionBootstrap {
   }
 
   private isWarm(session: UpstreamBootstrapSession | undefined): boolean {
-    return !!session?.warmedUpAt && (Date.now() - session.warmedUpAt) <= this.warmupMaxAgeMs;
+    return !!session?.warmedUpAt &&
+      (Date.now() - session.warmedUpAt) <= this.warmupMaxAgeMs;
   }
 
   private async warmup(session: UpstreamBootstrapSession): Promise<void> {
@@ -3691,13 +6268,17 @@ class UpstreamSessionBootstrap {
       Accept: "*/*",
       Authorization: `Bearer ${session.authToken}`,
     };
-    const steps: Array<{ method: "GET" | "POST"; endpoint: string; body?: string }> = [
+    const steps: Array<
+      { method: "GET" | "POST"; endpoint: string; body?: string }
+    > = [
       { method: "GET", endpoint: `${ORIGIN_BASE}/api/config` },
       { method: "GET", endpoint: `${ORIGIN_BASE}/api/models` },
       {
         method: "POST",
         endpoint: `${ORIGIN_BASE}/api/v1/users/user/settings/update`,
-        body: JSON.stringify({ ui: { timezone: getPreferredBrowserTimezone() } }),
+        body: JSON.stringify({
+          ui: { timezone: getPreferredBrowserTimezone() },
+        }),
       },
       { method: "GET", endpoint: `${ORIGIN_BASE}/api/v1/scene-cfg/` },
       { method: "GET", endpoint: `${ORIGIN_BASE}/api/v1/users/user/settings` },
@@ -3706,7 +6287,9 @@ class UpstreamSessionBootstrap {
       try {
         const requestHeaders = {
           ...baseHeaders,
-          ...(step.method === "POST" ? { "Content-Type": "application/json" } : {}),
+          ...(step.method === "POST"
+            ? { "Content-Type": "application/json" }
+            : {}),
           ...(mergedCookieHeader ? { Cookie: mergedCookieHeader } : {}),
         };
         const response = await fetch(step.endpoint, {
@@ -3738,8 +6321,14 @@ class UpstreamSessionBootstrap {
     session.warmedUpAt = Date.now();
   }
 
-  private mergeWarmupCookies(session: UpstreamBootstrapSession, setCookieHeader: string | null): void {
-    session.cookieHeader = mergeSetCookieHeader(session.cookieHeader, setCookieHeader);
+  private mergeWarmupCookies(
+    session: UpstreamBootstrapSession,
+    setCookieHeader: string | null,
+  ): void {
+    session.cookieHeader = mergeSetCookieHeader(
+      session.cookieHeader,
+      setCookieHeader,
+    );
     session.updatedAt = Date.now();
   }
 
@@ -3753,7 +6342,10 @@ class UpstreamSessionBootstrap {
     this.pending.delete(token);
   }
 
-  async ensureSession(token: string, refererChatID = ""): Promise<UpstreamBootstrapSession> {
+  async ensureSession(
+    token: string,
+    refererChatID = "",
+  ): Promise<UpstreamBootstrapSession> {
     const seeded = findBootstrapSessionByToken(token);
     const cached = this.sessions.get(token) || seeded || undefined;
     if (this.isFresh(cached)) {
@@ -3786,22 +6378,29 @@ class UpstreamSessionBootstrap {
     }
   }
 
-  private async bootstrap(token: string, refererChatID = ""): Promise<UpstreamBootstrapSession> {
+  private async bootstrap(
+    token: string,
+    refererChatID = "",
+  ): Promise<UpstreamBootstrapSession> {
     const headers = await SmartHeaderGenerator.generateHeaders(refererChatID);
     const seeded = findBootstrapSessionByToken(token);
     const bootstrapCookieHeader = mergeCookieHeaders(
       seeded?.cookieHeader,
       UPSTREAM_EXTRA_COOKIE_HEADER,
     );
-    const response = await fetchWithCurlFallback(`${ORIGIN_BASE}/api/v1/auths/`, {
-      method: "GET",
-      headers: {
-        ...headers,
-        Accept: "*/*",
-        Authorization: `Bearer ${token}`,
-        ...(bootstrapCookieHeader ? { Cookie: bootstrapCookieHeader } : {}),
+    const response = await fetchWithCurlFallback(
+      `${ORIGIN_BASE}/api/v1/auths/`,
+      {
+        method: "GET",
+        headers: {
+          ...headers,
+          Accept: "*/*",
+          Authorization: `Bearer ${token}`,
+          ...(bootstrapCookieHeader ? { Cookie: bootstrapCookieHeader } : {}),
+        },
       },
-    }, "上游 session bootstrap /api/v1/auths/");
+      "上游 session bootstrap /api/v1/auths/",
+    );
     if (!response.ok) {
       throw new Error(`upstream auth bootstrap failed: ${response.status}`);
     }
@@ -3843,7 +6442,10 @@ class UpstreamSessionBootstrap {
     }
     const session = {
       mode: seeded?.mode || "configured_token",
-      cookieHeader: mergeCookieHeaders(cookieHeader, `token=${returnedAuthToken}`),
+      cookieHeader: mergeCookieHeaders(
+        cookieHeader,
+        `token=${returnedAuthToken}`,
+      ),
       // 真实前端后续请求继续使用 localStorage 原始 token，而不是 /auths 返回的新 token。
       authToken: token,
       returnedAuthToken,
@@ -3851,8 +6453,10 @@ class UpstreamSessionBootstrap {
       profileEmail,
       profileName,
       profileRole,
-      requestProfile: seeded?.requestProfile || buildImportedSessionProfiles().requestProfile,
-      fingerprintProfile: seeded?.fingerprintProfile || buildImportedSessionProfiles().fingerprintProfile,
+      requestProfile: seeded?.requestProfile ||
+        buildImportedSessionProfiles().requestProfile,
+      fingerprintProfile: seeded?.fingerprintProfile ||
+        buildImportedSessionProfiles().fingerprintProfile,
       updatedAt: Date.now(),
     };
     debugLog(
@@ -3877,20 +6481,28 @@ class UpstreamSessionBootstrap {
       session.cookieHeader,
       UPSTREAM_EXTRA_COOKIE_HEADER,
     );
-    const response = await fetchWithCurlFallback(`${ORIGIN_BASE}/api/v1/chats/new`, {
-      method: "POST",
-      headers: {
-        ...headers,
-        Accept: "application/json",
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${session.authToken}`,
-        ...(mergedCookieHeader ? { Cookie: mergedCookieHeader } : {}),
+    const response = await fetchWithCurlFallback(
+      `${ORIGIN_BASE}/api/v1/chats/new`,
+      {
+        method: "POST",
+        headers: {
+          ...headers,
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${session.authToken}`,
+          ...(mergedCookieHeader ? { Cookie: mergedCookieHeader } : {}),
+        },
+        body: JSON.stringify({ chat: payload }),
       },
-      body: JSON.stringify({ chat: payload }),
-    }, "上游 chats/new");
+      "上游 chats/new",
+    );
     const bodyText = await response.text();
     if (!response.ok) {
-      throw new Error(`upstream chats/new failed: ${response.status} ${bodyText.slice(0, 400)}`);
+      throw new Error(
+        `upstream chats/new failed: ${response.status} ${
+          bodyText.slice(0, 400)
+        }`,
+      );
     }
     this.mergeResponseCookies(token, response);
     const parsed = JSON.parse(bodyText) as UpstreamChatBootstrapResult;
@@ -3925,7 +6537,7 @@ async function getAnonymousToken(): Promise<string> {
 async function generateSignature(
   e: string,
   t: string,
-  timestamp: number
+  timestamp: number,
 ): Promise<{ signature: string; timestamp: string }> {
   const timestampStr = String(timestamp);
 
@@ -3947,7 +6559,9 @@ async function generateSignature(
     // 从环境变量读取密钥
     if (/^[0-9a-fA-F]+$/.test(secretEnv) && secretEnv.length % 2 === 0) {
       // HEX 格式
-      rootKey = new Uint8Array(secretEnv.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16)));
+      rootKey = new Uint8Array(
+        secretEnv.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16)),
+      );
     } else {
       // UTF-8 格式
       rootKey = new TextEncoder().encode(secretEnv);
@@ -3955,24 +6569,30 @@ async function generateSignature(
     debugLog("使用环境变量密钥: %s", secretEnv.substring(0, 10) + "...");
   } else {
     // 使用新的默认密钥（与 Python 版本一致）
-    const defaultKeyHex = "6b65792d40404040292929282928283929292d787878782626262525252525";
-    rootKey = new Uint8Array(defaultKeyHex.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16)));
+    const defaultKeyHex =
+      "6b65792d40404040292929282928283929292d787878782626262525252525";
+    rootKey = new Uint8Array(
+      defaultKeyHex.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16)),
+    );
     debugLog("使用默认密钥");
   }
 
   // 5. 第一层 HMAC，生成中间密钥
-  const rootKeyBuffer = rootKey.buffer.slice(rootKey.byteOffset, rootKey.byteOffset + rootKey.byteLength) as ArrayBuffer;
+  const rootKeyBuffer = rootKey.buffer.slice(
+    rootKey.byteOffset,
+    rootKey.byteOffset + rootKey.byteLength,
+  ) as ArrayBuffer;
   const firstHmacKey = await crypto.subtle.importKey(
     "raw",
     rootKeyBuffer,
     { name: "HMAC", hash: "SHA-256" },
     false,
-    ["sign"]
+    ["sign"],
   );
   const firstSignatureBuffer = await crypto.subtle.sign(
     "HMAC",
     firstHmacKey,
-    new TextEncoder().encode(String(timeWindow))
+    new TextEncoder().encode(String(timeWindow)),
   );
   const intermediateKey = Array.from(new Uint8Array(firstSignatureBuffer))
     .map((b) => b.toString(16).padStart(2, "0"))
@@ -3985,12 +6605,12 @@ async function generateSignature(
     secondKeyMaterial,
     { name: "HMAC", hash: "SHA-256" },
     false,
-    ["sign"]
+    ["sign"],
   );
   const finalSignatureBuffer = await crypto.subtle.sign(
     "HMAC",
     secondHmacKey,
-    new TextEncoder().encode(stringToSign)
+    new TextEncoder().encode(stringToSign),
   );
   const signature = Array.from(new Uint8Array(finalSignatureBuffer))
     .map((b) => b.toString(16).padStart(2, "0"))
@@ -4034,9 +6654,19 @@ function extractLastHttpHeaderBlock(raw: string): string {
   return blocks[blocks.length - 1] || "";
 }
 
-async function runCurlCommand(args: string[], stdinText?: string): Promise<void> {
+async function runCurlCommand(
+  args: string[],
+  stdinText?: string,
+): Promise<void> {
   const proxyUrl = await resolveUpstreamProxyUrl();
-  const baseArgs = ["--compressed", ...args];
+  const baseArgs = [
+    "--compressed",
+    "--connect-timeout",
+    String(CURL_CONNECT_TIMEOUT_SECONDS),
+    "--max-time",
+    String(CURL_MAX_TIME_SECONDS),
+    ...args,
+  ];
   const finalArgs = proxyUrl ? ["--proxy", proxyUrl, ...baseArgs] : baseArgs;
   const child = new Deno.Command("curl", {
     args: finalArgs,
@@ -4050,32 +6680,25 @@ async function runCurlCommand(args: string[], stdinText?: string): Promise<void>
     writer.releaseLock();
     await child.stdin.close();
   }
-  const [status, stderrBytes] = await Promise.all([child.status, child.stderr.getReader().read()]);
-  if (!status.success) {
-    const stderrText = stderrBytes.value ? new TextDecoder().decode(stderrBytes.value) : "";
-    throw new Error(`curl failed (${status.code}): ${stderrText}`);
-  }
-}
-
-async function readCommandStdout(command: string, args: string[]): Promise<string> {
-  const child = new Deno.Command(command, {
-    args,
-    stdout: "piped",
-    stderr: "null",
-  }).spawn();
-  const [status, stdoutChunk] = await Promise.all([
+  const [status, stderrBytes] = await Promise.all([
     child.status,
-    child.stdout.getReader().read(),
+    child.stderr.getReader().read(),
   ]);
   if (!status.success) {
-    throw new Error(`${command} failed: ${status.code}`);
+    const stderrText = stderrBytes.value
+      ? new TextDecoder().decode(stderrBytes.value)
+      : "";
+    throw new Error(
+      `curl failed (${status.code}) [connect-timeout=${CURL_CONNECT_TIMEOUT_SECONDS}s max-time=${CURL_MAX_TIME_SECONDS}s]: ${stderrText}`,
+    );
   }
-  return stdoutChunk.value ? new TextDecoder().decode(stdoutChunk.value).trim() : "";
 }
 
 function parseHostResolveOverrides(spec: string): Record<string, string> {
   const out: Record<string, string> = {};
-  for (const part of spec.split(/[\n,]/).map((item) => item.trim()).filter(Boolean)) {
+  for (
+    const part of spec.split(/[\n,]/).map((item) => item.trim()).filter(Boolean)
+  ) {
     const idx = part.indexOf("=");
     if (idx === -1) continue;
     const host = part.slice(0, idx).trim().toLowerCase();
@@ -4087,7 +6710,9 @@ function parseHostResolveOverrides(spec: string): Record<string, string> {
   return out;
 }
 
-const HOST_RESOLVE_OVERRIDES = parseHostResolveOverrides(UPSTREAM_HOST_RESOLVE_OVERRIDES);
+const HOST_RESOLVE_OVERRIDES = parseHostResolveOverrides(
+  UPSTREAM_HOST_RESOLVE_OVERRIDES,
+);
 
 function getCurlResolveArgsForUrl(targetUrl: string): string[] {
   try {
@@ -4106,73 +6731,6 @@ function hasCurlResolveOverride(targetUrl: string): boolean {
   return getCurlResolveArgsForUrl(targetUrl).length > 0;
 }
 
-async function detectSystemProxyUrl(): Promise<string | null> {
-  if (!UPSTREAM_SYSTEM_PROXY_AUTO_DETECT) {
-    return null;
-  }
-
-  try {
-    const mode = await readCommandStdout("gsettings", [
-      "get",
-      "org.gnome.system.proxy",
-      "mode",
-    ]);
-    if (!mode.includes("manual")) {
-      return null;
-    }
-
-    const httpHost = (await readCommandStdout("gsettings", [
-      "get",
-      "org.gnome.system.proxy.http",
-      "host",
-    ])).replaceAll("'", "").trim();
-    const httpPort = (await readCommandStdout("gsettings", [
-      "get",
-      "org.gnome.system.proxy.http",
-      "port",
-    ])).trim();
-    if (httpHost && httpPort && httpPort !== "0") {
-      return `http://${httpHost}:${httpPort}`;
-    }
-
-    const socksHost = (await readCommandStdout("gsettings", [
-      "get",
-      "org.gnome.system.proxy.socks",
-      "host",
-    ])).replaceAll("'", "").trim();
-    const socksPort = (await readCommandStdout("gsettings", [
-      "get",
-      "org.gnome.system.proxy.socks",
-      "port",
-    ])).trim();
-    if (socksHost && socksPort && socksPort !== "0") {
-      return `socks5h://${socksHost}:${socksPort}`;
-    }
-  } catch (error) {
-    debugLog("系统代理探测失败: %v", error);
-  }
-
-  return null;
-}
-
-function detectEnvProxyUrl(): string | null {
-  const candidates = [
-    Deno.env.get("HTTPS_PROXY"),
-    Deno.env.get("https_proxy"),
-    Deno.env.get("ALL_PROXY"),
-    Deno.env.get("all_proxy"),
-    Deno.env.get("HTTP_PROXY"),
-    Deno.env.get("http_proxy"),
-  ];
-  for (const candidate of candidates) {
-    const value = String(candidate || "").trim();
-    if (value) {
-      return value;
-    }
-  }
-  return null;
-}
-
 async function resolveUpstreamProxyUrl(): Promise<string | null> {
   if (cachedResolvedProxyUrlPromise) {
     return cachedResolvedProxyUrlPromise;
@@ -4182,22 +6740,16 @@ async function resolveUpstreamProxyUrl(): Promise<string | null> {
     if (UPSTREAM_PROXY_URL.trim()) {
       return UPSTREAM_PROXY_URL.trim();
     }
-    const systemProxyUrl = await detectSystemProxyUrl();
-    if (systemProxyUrl) {
-      return systemProxyUrl;
-    }
-    const envProxyUrl = detectEnvProxyUrl();
-    if (envProxyUrl) {
-      return envProxyUrl;
-    }
     return null;
   })();
 
   const proxyUrl = await cachedResolvedProxyUrlPromise;
   if (proxyUrl) {
-    debugLog("上游代理已启用: %s", proxyUrl);
+    debugLog("上游代理已启用(仅显式配置): %s", proxyUrl);
   } else {
-    debugLog("上游代理未启用");
+    debugLog(
+      "上游代理未启用(未显式配置 UPSTREAM_PROXY_URL，使用 Deno 默认网络行为)",
+    );
   }
   return proxyUrl;
 }
@@ -4277,7 +6829,11 @@ async function fetchWithCurlFallback(
 ): Promise<Response> {
   const proxyUrl = await resolveUpstreamProxyUrl();
   if (proxyUrl) {
-    debugLog("%s 检测到代理，直接使用 curl 请求: %s", logLabel, proxyUrl);
+    debugLog(
+      "%s 检测到显式代理配置，直接使用 curl 请求: %s",
+      logLabel,
+      proxyUrl,
+    );
     return await callSimpleCurlRequest(fullURL, init);
   }
   try {
@@ -4421,10 +6977,18 @@ async function callUpstreamWithImpersonatedClient(
     child.stderr.getReader().read(),
   ]);
 
-  const stdoutText = stdoutChunk.value ? new TextDecoder().decode(stdoutChunk.value) : "";
-  const stderrText = stderrChunk.value ? new TextDecoder().decode(stderrChunk.value) : "";
+  const stdoutText = stdoutChunk.value
+    ? new TextDecoder().decode(stdoutChunk.value)
+    : "";
+  const stderrText = stderrChunk.value
+    ? new TextDecoder().decode(stderrChunk.value)
+    : "";
   if (!status.success) {
-    throw new Error(`impersonated client failed (${status.code}): ${stderrText || stdoutText}`);
+    throw new Error(
+      `impersonated client failed (${status.code}): ${
+        stderrText || stdoutText
+      }`,
+    );
   }
 
   let parsed: {
@@ -4436,7 +7000,11 @@ async function callUpstreamWithImpersonatedClient(
   try {
     parsed = JSON.parse(stdoutText);
   } catch (error) {
-    throw new Error(`impersonated client parse failed: ${String(error)} stdout=${stdoutText.slice(0, 500)}`);
+    throw new Error(
+      `impersonated client parse failed: ${String(error)} stdout=${
+        stdoutText.slice(0, 500)
+      }`,
+    );
   }
 
   return new Response(parsed.body || "", {
@@ -4449,7 +7017,7 @@ async function callUpstreamWithImpersonatedClient(
 async function callUpstreamWithHeaders(
   upstreamReq: UpstreamRequest,
   refererChatID: string,
-  authToken: string
+  authToken: string,
 ): Promise<Response> {
   try {
     debugLog("调用上游API: %s", UPSTREAM_URL);
@@ -4460,7 +7028,7 @@ async function callUpstreamWithHeaders(
       const tokenParts = authToken.split(".");
       if (tokenParts.length === 3) {
         const payload = JSON.parse(
-          new TextDecoder().decode(decodeBase64(tokenParts[1]))
+          new TextDecoder().decode(decodeBase64(tokenParts[1])),
         );
 
         // 尝试多个可能的 user_id 字段（与 Python 版本一致）
@@ -4483,7 +7051,9 @@ async function callUpstreamWithHeaders(
     // 2. 准备签名所需参数
     const timestamp = Date.now();
     const requestId = crypto.randomUUID();
-    const lastMessageContent = ImageProcessor.extractLastUserContent(upstreamReq.messages);
+    const lastMessageContent = ImageProcessor.extractLastUserContent(
+      upstreamReq.messages,
+    );
 
     if (!lastMessageContent) {
       throw new Error("无法获取用于签名的用户消息内容");
@@ -4495,18 +7065,23 @@ async function callUpstreamWithHeaders(
     const { signature } = await generateSignature(
       e,
       lastMessageContent,
-      timestamp
+      timestamp,
     );
     debugLog("生成新版签名: %s", signature);
 
     const reqBody = JSON.stringify(upstreamReq);
-    debugLog("上游请求体: %s", reqBody);
+    debugLog("上游请求体: %s", redactJsonForLog(upstreamReq));
 
     // 4. 生成智能浏览器头部
-    const smartHeaders = await SmartHeaderGenerator.generateHeaders(refererChatID);
+    const smartHeaders = await SmartHeaderGenerator.generateHeaders(
+      refererChatID,
+    );
     let sessionCookieHeader = "";
     try {
-      const session = await upstreamSessionBootstrap.ensureSession(authToken, refererChatID);
+      const session = await upstreamSessionBootstrap.ensureSession(
+        authToken,
+        refererChatID,
+      );
       sessionCookieHeader = session.cookieHeader || "";
     } catch (sessionError) {
       debugLog("上游 session bootstrap 失败: %v", sessionError);
@@ -4517,12 +7092,13 @@ async function callUpstreamWithHeaders(
     );
 
     // 5. 生成完整的浏览器指纹参数
-    const fingerprintParams = BrowserFingerprintGenerator.generateFingerprintParams(
-      timestamp,
-      requestId,
-      authToken,
-      refererChatID
-    );
+    const fingerprintParams = BrowserFingerprintGenerator
+      .generateFingerprintParams(
+        timestamp,
+        requestId,
+        authToken,
+        refererChatID,
+      );
 
     // 6. 构建完整的URL参数
     const allParams = {
@@ -4539,9 +7115,13 @@ async function callUpstreamWithHeaders(
       "Authorization": `Bearer ${authToken}`,
       "Accept": "*/*",
       "Content-Type": "application/json",
-      "Accept-Language": smartHeaders["Accept-Language"] || getPreferredBrowserAcceptLanguage(),
+      "Accept-Language": smartHeaders["Accept-Language"] ||
+        getPreferredBrowserAcceptLanguage(),
       "Origin": ORIGIN_BASE,
-      "Referer": "",
+      "Referer": smartHeaders["Referer"] ||
+        (refererChatID
+          ? `${ORIGIN_BASE}/c/${refererChatID}`
+          : `${ORIGIN_BASE}/`),
       "Sec-Fetch-Dest": "empty",
       "Sec-Fetch-Mode": "cors",
       "Sec-Fetch-Site": "same-origin",
@@ -4552,7 +7132,9 @@ async function callUpstreamWithHeaders(
       "X-FE-Version": X_FE_VERSION,
       "X-Region": BROWSER_REGION,
       "X-Signature": signature,
-      ...(mergedSessionCookieHeader ? { "Cookie": mergedSessionCookieHeader } : {}),
+      ...(mergedSessionCookieHeader
+        ? { "Cookie": mergedSessionCookieHeader }
+        : {}),
     };
 
     debugLog(
@@ -4570,51 +7152,119 @@ async function callUpstreamWithHeaders(
       maskToken(queryToken),
       summarizeCookieHeader(mergedSessionCookieHeader),
     );
-    debugLog("上游请求 URL: %s", fullURL);
+    debugLog("上游请求 URL: %s", redactUrlForLog(fullURL));
 
-    const transportPreference = ["auto", "fetch", "curl", "impersonate"].includes(UPSTREAM_TRANSPORT_PREFERENCE)
-      ? UPSTREAM_TRANSPORT_PREFERENCE
-      : "auto";
+    const transportPreference =
+      ["auto", "fetch", "curl", "impersonate"].includes(
+          UPSTREAM_TRANSPORT_PREFERENCE,
+        )
+        ? UPSTREAM_TRANSPORT_PREFERENCE
+        : "auto";
     let response: Response;
     if (transportPreference === "curl") {
       debugLog("上游传输模式: curl");
-      response = await callUpstreamWithCurl(fullURL, finalHeaders, authToken, reqBody);
-      debugLog("curl transport 上游响应状态: %d %s", response.status, response.statusText);
+      response = await callUpstreamWithCurl(
+        fullURL,
+        finalHeaders,
+        authToken,
+        reqBody,
+      );
+      debugLog(
+        "curl transport 上游响应状态: %d %s",
+        response.status,
+        response.statusText,
+      );
     } else if (transportPreference === "impersonate") {
       debugLog("上游传输模式: impersonate");
-      response = await callUpstreamWithImpersonatedClient(fullURL, finalHeaders, authToken, reqBody);
-      debugLog("impersonated transport 上游响应状态: %d %s", response.status, response.statusText);
+      response = await callUpstreamWithImpersonatedClient(
+        fullURL,
+        finalHeaders,
+        authToken,
+        reqBody,
+      );
+      debugLog(
+        "impersonated transport 上游响应状态: %d %s",
+        response.status,
+        response.statusText,
+      );
     } else {
-      if (hasCurlResolveOverride(fullURL)) {
-        debugLog("上游传输模式: auto(检测到 --resolve 覆盖，优先 curl)");
-        response = await callUpstreamWithCurl(fullURL, finalHeaders, authToken, reqBody);
-        debugLog("curl transport 上游响应状态: %d %s", response.status, response.statusText);
+      if (
+        hasCurlResolveOverride(fullURL) &&
+        UPSTREAM_AUTO_PREFER_CURL_ON_RESOLVE
+      ) {
+        debugLog("上游传输模式: auto(检测到 --resolve 覆盖，按配置优先 curl)");
+        response = await callUpstreamWithCurl(
+          fullURL,
+          finalHeaders,
+          authToken,
+          reqBody,
+        );
+        debugLog(
+          "curl transport 上游响应状态: %d %s",
+          response.status,
+          response.statusText,
+        );
       } else {
-      if (transportPreference !== "fetch") {
-        debugLog("上游传输模式: auto(fetch 优先)");
-      } else {
-        debugLog("上游传输模式: fetch");
-      }
-      response = await fetch(fullURL, {
-        method: "POST",
-        headers: finalHeaders,
-        body: reqBody,
-      });
+        if (hasCurlResolveOverride(fullURL)) {
+          debugLog(
+            "上游传输模式: auto(检测到 --resolve 覆盖，但默认仍先 fetch，curl 仅作回退)",
+          );
+        }
+        if (transportPreference !== "fetch") {
+          debugLog("上游传输模式: auto(fetch 优先)");
+        } else {
+          debugLog("上游传输模式: fetch");
+        }
+        response = await fetch(fullURL, {
+          method: "POST",
+          headers: finalHeaders,
+          body: reqBody,
+        });
 
-      debugLog("上游响应状态: %d %s", response.status, response.statusText);
-      if (transportPreference === "auto" && (response.status === 404 || response.status === 405)) {
-        debugLog("检测到 Deno fetch 上游异常状态，切换 impersonated transport 重试: %d", response.status);
-        response = await callUpstreamWithImpersonatedClient(fullURL, finalHeaders, authToken, reqBody);
-        debugLog("impersonated transport 上游响应状态: %d %s", response.status, response.statusText);
-        if (response.status === 404 || response.status === 405) {
-          debugLog("impersonated transport 仍异常，切换 curl transport 重试: %d", response.status);
-          response = await callUpstreamWithCurl(fullURL, finalHeaders, authToken, reqBody);
-          debugLog("curl transport 上游响应状态: %d %s", response.status, response.statusText);
+        debugLog("上游响应状态: %d %s", response.status, response.statusText);
+        if (
+          transportPreference === "auto" &&
+          (response.status === 404 || response.status === 405)
+        ) {
+          debugLog(
+            "检测到 Deno fetch 上游异常状态，切换 impersonated transport 重试: %d",
+            response.status,
+          );
+          response = await callUpstreamWithImpersonatedClient(
+            fullURL,
+            finalHeaders,
+            authToken,
+            reqBody,
+          );
+          debugLog(
+            "impersonated transport 上游响应状态: %d %s",
+            response.status,
+            response.statusText,
+          );
+          if (response.status === 404 || response.status === 405) {
+            debugLog(
+              "impersonated transport 仍异常，切换 curl transport 重试: %d",
+              response.status,
+            );
+            response = await callUpstreamWithCurl(
+              fullURL,
+              finalHeaders,
+              authToken,
+              reqBody,
+            );
+            debugLog(
+              "curl transport 上游响应状态: %d %s",
+              response.status,
+              response.statusText,
+            );
+          }
         }
       }
-      }
     }
-    if (response.status === 401 || response.status === 403 || response.status === 405) {
+    if (
+      response.status === 401 || response.status === 403 ||
+      response.status === 405
+    ) {
       upstreamSessionBootstrap.invalidate(authToken);
     }
 
@@ -4628,7 +7278,9 @@ async function callUpstreamWithHeaders(
       debugLog("尝试直接使用 impersonated transport 兜底");
       const timestamp = Date.now();
       const requestId = crypto.randomUUID();
-      const lastMessageContent = ImageProcessor.extractLastUserContent(upstreamReq.messages);
+      const lastMessageContent = ImageProcessor.extractLastUserContent(
+        upstreamReq.messages,
+      );
       if (!lastMessageContent) {
         throw error;
       }
@@ -4637,7 +7289,7 @@ async function callUpstreamWithHeaders(
         const tokenParts = authToken.split(".");
         if (tokenParts.length === 3) {
           const payload = JSON.parse(
-            new TextDecoder().decode(decodeBase64(tokenParts[1]))
+            new TextDecoder().decode(decodeBase64(tokenParts[1])),
           );
           for (const key of ["id", "user_id", "uid", "sub"]) {
             const val = payload[key];
@@ -4653,19 +7305,29 @@ async function callUpstreamWithHeaders(
       } catch (_innerErr) {
         // ignore
       }
-      const e = `requestId,${requestId},timestamp,${timestamp},user_id,${userId}`;
-      const { signature } = await generateSignature(e, lastMessageContent, timestamp);
-      const smartHeaders = await SmartHeaderGenerator.generateHeaders(refererChatID);
-      const fingerprintParams = BrowserFingerprintGenerator.generateFingerprintParams(
+      const e =
+        `requestId,${requestId},timestamp,${timestamp},user_id,${userId}`;
+      const { signature } = await generateSignature(
+        e,
+        lastMessageContent,
         timestamp,
-        requestId,
-        authToken,
-        refererChatID
       );
-      const fullURL = `${UPSTREAM_URL}?${new URLSearchParams({
-        ...fingerprintParams,
-        signature_timestamp: timestamp.toString(),
-      }).toString()}`;
+      const smartHeaders = await SmartHeaderGenerator.generateHeaders(
+        refererChatID,
+      );
+      const fingerprintParams = BrowserFingerprintGenerator
+        .generateFingerprintParams(
+          timestamp,
+          requestId,
+          authToken,
+          refererChatID,
+        );
+      const fullURL = `${UPSTREAM_URL}?${
+        new URLSearchParams({
+          ...fingerprintParams,
+          signature_timestamp: timestamp.toString(),
+        }).toString()
+      }`;
       const finalHeaders = {
         ...smartHeaders,
         "Authorization": `Bearer ${authToken}`,
@@ -4674,11 +7336,21 @@ async function callUpstreamWithHeaders(
       };
       const reqBody = JSON.stringify(upstreamReq);
       try {
-        return await callUpstreamWithImpersonatedClient(fullURL, finalHeaders, authToken, reqBody);
+        return await callUpstreamWithImpersonatedClient(
+          fullURL,
+          finalHeaders,
+          authToken,
+          reqBody,
+        );
       } catch (impersonatedError) {
         debugLog("impersonated transport 兜底失败: %v", impersonatedError);
       }
-      return await callUpstreamWithCurl(fullURL, finalHeaders, authToken, reqBody);
+      return await callUpstreamWithCurl(
+        fullURL,
+        finalHeaders,
+        authToken,
+        reqBody,
+      );
     } catch (curlError) {
       debugLog("curl transport 兜底失败: %v", curlError);
     }
@@ -4687,7 +7359,7 @@ async function callUpstreamWithHeaders(
     try {
       const newToken = await tokenPool.switchToNext();
       if (newToken) {
-        debugLog("切换到新 Token 重试: %s", newToken.substring(0, 20));
+        debugLog("切换到新 Token 重试: %s", maskToken(newToken));
         // 递归重试一次，避免无限循环
         return callUpstreamWithHeaders(upstreamReq, refererChatID, newToken);
       }
@@ -4725,15 +7397,337 @@ function transformThinking(content: string): string {
   return result.trim();
 }
 
+type ThinkingOutputMode = "merge" | "answer_only" | "separate";
+
+function getThinkingOutputMode(): ThinkingOutputMode {
+  switch (THINKING_OUTPUT_MODE) {
+    case "merge":
+    case "answer_only":
+    case "separate":
+      return THINKING_OUTPUT_MODE;
+    default:
+      return "answer_only";
+  }
+}
+
+function normalizeUpstreamDelta(
+  upstreamData: UpstreamData,
+): { content: string; reasoningContent: string } {
+  const phase = upstreamData.data.phase;
+  const delta = upstreamData.data.delta_content || "";
+  if (!delta) {
+    return { content: "", reasoningContent: "" };
+  }
+
+  if (phase !== "thinking") {
+    return { content: delta, reasoningContent: "" };
+  }
+
+  const transformedThinking = transformThinking(delta);
+  if (!transformedThinking) {
+    return { content: "", reasoningContent: "" };
+  }
+
+  switch (getThinkingOutputMode()) {
+    case "merge":
+      return { content: transformedThinking, reasoningContent: "" };
+    case "separate":
+      return { content: "", reasoningContent: transformedThinking };
+    case "answer_only":
+    default:
+      return { content: "", reasoningContent: transformedThinking };
+  }
+}
+
+function writeStreamChunkFromNormalizedDelta(
+  normalizedDelta: { content: string; reasoningContent: string },
+  modelName: string,
+): OpenAIResponse | null {
+  if (!normalizedDelta.content && !normalizedDelta.reasoningContent) {
+    return null;
+  }
+  const delta: Delta = {};
+  if (normalizedDelta.content) {
+    delta.content = normalizedDelta.content;
+  }
+  if (
+    normalizedDelta.reasoningContent &&
+    getThinkingOutputMode() === "separate"
+  ) {
+    delta.reasoning_content = normalizedDelta.reasoningContent;
+  }
+  if (!delta.content && !delta.reasoning_content) {
+    return null;
+  }
+  return {
+    id: `chatcmpl-${Date.now()}`,
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model: modelName,
+    choices: [
+      {
+        index: 0,
+        delta,
+      },
+    ],
+  };
+}
+
+function collectFullResponseFromText(rawText: string): {
+  content: string;
+  reasoningContent: string;
+} {
+  let content = "";
+  let reasoningContent = "";
+  for (const line of rawText.split(/\r?\n/)) {
+    if (!line.startsWith("data: ")) continue;
+    const dataStr = line.substring(6).trim();
+    if (!dataStr || dataStr === "[DONE]") continue;
+    const upstreamData = JSON.parse(dataStr) as UpstreamData;
+    const errObj = getUpstreamErrorFromChunk(upstreamData);
+    if (errObj) {
+      throw new Error(`UPSTREAM_SSE_ERROR:${JSON.stringify(errObj)}`);
+    }
+    const normalizedDelta = normalizeUpstreamDelta(upstreamData);
+    if (normalizedDelta.content) {
+      content += normalizedDelta.content;
+    }
+    if (normalizedDelta.reasoningContent) {
+      reasoningContent += normalizedDelta.reasoningContent;
+    }
+    if (upstreamData.data.done || upstreamData.data.phase === "done") {
+      return { content, reasoningContent };
+    }
+  }
+  return { content, reasoningContent };
+}
+
+function shouldHoldToolBridgeTextForSieve(content: string): boolean {
+  const trimmed = normalizeToolMarkup(content).trimStart();
+  if (!trimmed) return true;
+  if (
+    trimmed.startsWith("{") ||
+    trimmed.startsWith("[") ||
+    trimmed.startsWith("<") ||
+    trimmed.startsWith("```")
+  ) {
+    return true;
+  }
+  return /(?:tool_calls|<tool_calls|<invoke\b|"tool_calls"|"function"\s*:)/i
+    .test(trimmed);
+}
+
+async function writeOpenAIContentStreamChunk(
+  writer: WritableStreamDefaultWriter<Uint8Array>,
+  encoder: TextEncoder,
+  modelName: string,
+  content: string,
+): Promise<void> {
+  if (!content) return;
+  const chunk = writeStreamChunkFromNormalizedDelta(
+    { content, reasoningContent: "" },
+    modelName,
+  );
+  if (!chunk) return;
+  await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+}
+
+async function writeToolCallStreamChunks(
+  writer: WritableStreamDefaultWriter<Uint8Array>,
+  encoder: TextEncoder,
+  req: OpenAIRequest,
+  toolCallMessage: Message,
+): Promise<void> {
+  const toolCallChunk: OpenAIResponse = {
+    id: `chatcmpl-${Date.now()}`,
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model: req.model,
+    choices: [{
+      index: 0,
+      delta: {
+        tool_calls: (toolCallMessage.tool_calls || []).map((
+          toolCall,
+          index,
+        ) => ({
+          index,
+          id: toolCall.id,
+          type: "function" as const,
+          function: {
+            name: toolCall.function.name,
+            arguments: toolCall.function.arguments,
+          },
+        })),
+      },
+    }],
+  };
+  const endChunk: OpenAIResponse = {
+    id: `chatcmpl-${Date.now()}`,
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model: req.model,
+    choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+  };
+  await writer.write(
+    encoder.encode(`data: ${JSON.stringify(toolCallChunk)}\n\n`),
+  );
+  await writer.write(encoder.encode(`data: ${JSON.stringify(endChunk)}\n\n`));
+}
+
+async function processZaiToolBridgeStream(
+  body: ReadableStream<Uint8Array>,
+  writer: WritableStreamDefaultWriter<Uint8Array>,
+  encoder: TextEncoder,
+  req: OpenAIRequest,
+  authToken: string,
+  requestStartTime?: number,
+): Promise<{
+  content: string;
+  reasoningContent: string;
+  toolCallMessage: Message | null;
+}> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let content = "";
+  let reasoningContent = "";
+  let pendingContent = "";
+  let firstDeltaLogged = false;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        const dataStr = line.substring(6).trim();
+        if (!dataStr || dataStr === "[DONE]") continue;
+
+        if (!firstDeltaLogged && requestStartTime) {
+          firstDeltaLogged = true;
+          debugStageDuration("upstream.first_sse_chunk", requestStartTime);
+        }
+
+        try {
+          const parsedChunk = JSON.parse(dataStr) as unknown;
+          const pieces = extractResponsePiecesFromUnknownChunk(parsedChunk);
+          const errObj = pieces.error;
+          if (errObj) {
+            if (isUpstreamCaptchaError(errObj)) {
+              invalidateCaptchaVerifyParam(
+                authToken,
+                `upstream-stream-error:${
+                  errObj.verify_code || errObj.captcha_error_type ||
+                  errObj.error_code || errObj.code || "unknown"
+                }`,
+              );
+            }
+            throw new Error(`UPSTREAM_SSE_ERROR:${JSON.stringify(errObj)}`);
+          }
+
+          if (pieces.content) {
+            content += pieces.content;
+            pendingContent += pieces.content;
+            const directToolCalls = extractZaiBridgeToolCalls(
+              content,
+              req.tools,
+            );
+            if (directToolCalls.length > 0) {
+              debugLog("🔧 Z.ai stream sieve 检测到工具调用，停止自然语言输出");
+              return {
+                content,
+                reasoningContent,
+                toolCallMessage: {
+                  role: "assistant",
+                  content: null,
+                  tool_calls: directToolCalls,
+                },
+              };
+            }
+
+            // Keep a small leading buffer so XML/JSON tool-call payloads do not
+            // leak while still allowing normal natural-language answers to stream.
+            if (
+              pendingContent.length >= 512 &&
+              !shouldHoldToolBridgeTextForSieve(content)
+            ) {
+              await writeOpenAIContentStreamChunk(
+                writer,
+                encoder,
+                req.model,
+                pendingContent,
+              );
+              pendingContent = "";
+            }
+          }
+          if (pieces.reasoningContent) {
+            reasoningContent += pieces.reasoningContent;
+          }
+
+          if (pieces.done) {
+            const toolCallMessage = buildZaiBridgeToolCallResponseMessage(
+              content,
+              req,
+            );
+            if (toolCallMessage?.tool_calls?.length) {
+              return { content, reasoningContent, toolCallMessage };
+            }
+            if (pendingContent) {
+              await writeOpenAIContentStreamChunk(
+                writer,
+                encoder,
+                req.model,
+                pendingContent,
+              );
+              pendingContent = "";
+            }
+            return { content, reasoningContent, toolCallMessage: null };
+          }
+        } catch (error) {
+          const message = String(error && (error as Error).message || error);
+          if (message.startsWith("UPSTREAM_SSE_ERROR:")) throw error;
+          debugLog("tool bridge stream sieve 解析片段失败: %s", message);
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const toolCallMessage = buildZaiBridgeToolCallResponseMessage(content, req);
+  if (toolCallMessage?.tool_calls?.length) {
+    return { content, reasoningContent, toolCallMessage };
+  }
+  if (pendingContent) {
+    await writeOpenAIContentStreamChunk(
+      writer,
+      encoder,
+      req.model,
+      pendingContent,
+    );
+  }
+  return { content, reasoningContent, toolCallMessage: null };
+}
+
 async function processUpstreamStream(
   body: ReadableStream<Uint8Array>,
   writer: WritableStreamDefaultWriter<Uint8Array>,
   encoder: TextEncoder,
-  modelName: string
-): Promise<void> {
+  modelName: string,
+  authToken: string,
+  requestStartTime?: number,
+): Promise<{ content: string; reasoningContent: string }> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let firstDeltaLogged = false;
+  let closeWriterOnExit = true;
+  let content = "";
+  let reasoningContent = "";
 
   try {
     while (true) {
@@ -4746,9 +7740,17 @@ async function processUpstreamStream(
 
       for (const line of lines) {
         if (line.startsWith("data: ")) {
-          const dataStr = line.substring(6);
+          const dataStr = line.substring(6).trim();
           if (dataStr === "") continue;
+          if (dataStr === "[DONE]") {
+            await writer.write(encoder.encode("data: [DONE]\n\n"));
+            return { content, reasoningContent };
+          }
 
+          if (!firstDeltaLogged && requestStartTime) {
+            firstDeltaLogged = true;
+            debugStageDuration("upstream.first_sse_chunk", requestStartTime);
+          }
           debugLog("收到SSE数据: %s", dataStr);
 
           try {
@@ -4760,24 +7762,28 @@ async function processUpstreamStream(
               upstreamData.data.error ||
               (upstreamData.data.inner && upstreamData.data.inner.error)
             ) {
-              const errObj =
-                upstreamData.error ||
+              const errObj = upstreamData.error ||
                 upstreamData.data.error ||
                 (upstreamData.data.inner && upstreamData.data.inner.error);
               debugLog(
-                "上游错误: code=%d, detail=%s",
+                "上游错误: code=%s, detail=%s",
                 errObj?.code,
-                errObj?.detail
+                errObj?.detail,
               );
               if (isUpstreamCaptchaError(errObj)) {
                 invalidateCaptchaVerifyParam(
+                  authToken,
                   `upstream-stream-error:${
-                    errObj?.verify_code || errObj?.captcha_error_type || errObj?.error_code || errObj?.code || "unknown"
+                    errObj?.verify_code || errObj?.captcha_error_type ||
+                    errObj?.error_code || errObj?.code || "unknown"
                   }`,
+                );
+                throw new Error(
+                  `UPSTREAM_SSE_ERROR:${JSON.stringify(errObj)}`,
                 );
               }
 
-              // 分析错误类型，特别是多模态相关错误
+              // 分析上游通用错误，避免把纯文本失败误判为图片问题。
               const errorDetail = (errObj?.detail || "").toLowerCase();
               if (
                 errorDetail.includes("something went wrong") ||
@@ -4785,12 +7791,18 @@ async function processUpstreamStream(
               ) {
                 debugLog("🚨 Z.ai 服务器错误分析:");
                 debugLog("   📋 错误详情: %s", errObj?.detail);
-                debugLog("   🖼️  可能原因: 图片处理失败");
+                debugLog(
+                  "   🧩 可能原因: 上游会话状态异常、CAPTCHA 重试状态冲突或服务端临时失败",
+                );
                 debugLog("   💡 建议解决方案:");
-                debugLog("      1. 使用更小的图片 (< 500KB)");
-                debugLog("      2. 尝试不同的图片格式 (JPEG 而不是 PNG)");
+                debugLog(
+                  "      1. 优先确认首次请求是否已携带 captcha_verify_param",
+                );
+                debugLog(
+                  "      2. CAPTCHA 错误后应重建 chat/message id 再重试",
+                );
                 debugLog("      3. 稍后重试 (可能是服务器负载问题)");
-                debugLog("      4. 检查图片是否损坏");
+                debugLog("      4. 若为多模态请求，再检查文件大小和格式");
               }
 
               const upstreamMessage = errObj?.detail || "Upstream stream error";
@@ -4798,16 +7810,17 @@ async function processUpstreamStream(
                 error: {
                   message: upstreamMessage,
                   type: "upstream_stream_error",
-                  code: errObj?.error_code || errObj?.code || "UPSTREAM_STREAM_ERROR",
+                  code: errObj?.error_code || errObj?.code ||
+                    "UPSTREAM_STREAM_ERROR",
                   captcha_error_type: errObj?.captcha_error_type,
                   verify_code: errObj?.verify_code,
                 },
               };
               await writer.write(
-                encoder.encode(`data: ${JSON.stringify(errorChunk)}\n\n`)
+                encoder.encode(`data: ${JSON.stringify(errorChunk)}\n\n`),
               );
               await writer.write(encoder.encode("data: [DONE]\n\n"));
-              return;
+              return { content, reasoningContent };
             }
 
             debugLog(
@@ -4817,7 +7830,7 @@ async function processUpstreamStream(
               upstreamData.data.delta_content
                 ? upstreamData.data.delta_content.length
                 : 0,
-              upstreamData.data.done
+              upstreamData.data.done,
             );
 
             // 处理内容
@@ -4825,29 +7838,23 @@ async function processUpstreamStream(
               upstreamData.data.delta_content &&
               upstreamData.data.delta_content !== ""
             ) {
-              let out = upstreamData.data.delta_content;
-              if (upstreamData.data.phase === "thinking") {
-                out = transformThinking(out);
-              }
+              const normalizedDelta = normalizeUpstreamDelta(upstreamData);
+              content += normalizedDelta.content;
+              reasoningContent += normalizedDelta.reasoningContent;
+              const chunk = writeStreamChunkFromNormalizedDelta(
+                normalizedDelta,
+                modelName,
+              );
 
-              if (out !== "") {
-                debugLog("发送内容(%s): %s", upstreamData.data.phase, out);
-
-                const chunk: OpenAIResponse = {
-                  id: `chatcmpl-${Date.now()}`,
-                  object: "chat.completion.chunk",
-                  created: Math.floor(Date.now() / 1000),
-                  model: modelName,
-                  choices: [
-                    {
-                      index: 0,
-                      delta: { content: out },
-                    },
-                  ],
-                };
-
+              if (chunk) {
+                debugLog(
+                  "发送内容(%s): answer_len=%d reasoning_len=%d",
+                  upstreamData.data.phase,
+                  normalizedDelta.content.length,
+                  normalizedDelta.reasoningContent.length,
+                );
                 await writer.write(
-                  encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`)
+                  encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`),
                 );
               }
             }
@@ -4872,23 +7879,33 @@ async function processUpstreamStream(
               };
 
               await writer.write(
-                encoder.encode(`data: ${JSON.stringify(endChunk)}\n\n`)
+                encoder.encode(`data: ${JSON.stringify(endChunk)}\n\n`),
               );
               await writer.write(encoder.encode("data: [DONE]\n\n"));
-              return;
+              return { content, reasoningContent };
             }
           } catch (error) {
+            const message = String(error && (error as Error).message || error);
+            if (message.startsWith("UPSTREAM_SSE_ERROR:")) {
+              closeWriterOnExit = false;
+              throw error;
+            }
             debugLog("SSE数据解析失败: %v", error);
           }
         }
       }
     }
+    return { content, reasoningContent };
   } finally {
-    writer.close();
+    if (closeWriterOnExit) {
+      await writer.close();
+    }
   }
 }
 
-function getUpstreamErrorFromChunk(upstreamData: UpstreamData): UpstreamError | null {
+function getUpstreamErrorFromChunk(
+  upstreamData: UpstreamData,
+): UpstreamError | null {
   return (
     upstreamData.error ||
     upstreamData.data.data?.error ||
@@ -4898,14 +7915,65 @@ function getUpstreamErrorFromChunk(upstreamData: UpstreamData): UpstreamError | 
   );
 }
 
-// 收集完整响应（用于非流式响应）
+function extractResponsePiecesFromUnknownChunk(
+  rawChunk: unknown,
+): {
+  content: string;
+  reasoningContent: string;
+  done: boolean;
+  error: UpstreamError | null;
+} {
+  if (!rawChunk || typeof rawChunk !== "object") {
+    return { content: "", reasoningContent: "", done: false, error: null };
+  }
+
+  const chunk = rawChunk as Record<string, any>;
+
+  if (chunk.data && typeof chunk.data === "object") {
+    const upstreamData = chunk as UpstreamData;
+    const errObj = getUpstreamErrorFromChunk(upstreamData);
+    const normalizedDelta = normalizeUpstreamDelta(upstreamData);
+    return {
+      content: normalizedDelta.content,
+      reasoningContent: normalizedDelta.reasoningContent,
+      done: !!upstreamData.data.done || upstreamData.data.phase === "done",
+      error: errObj,
+    };
+  }
+
+  const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : null;
+  const delta = choice?.delta || {};
+  const message = choice?.message || {};
+  const content = typeof delta.content === "string"
+    ? delta.content
+    : typeof message.content === "string"
+    ? message.content
+    : "";
+  const reasoningContent = typeof delta.reasoning_content === "string"
+    ? delta.reasoning_content
+    : typeof message.reasoning_content === "string"
+    ? message.reasoning_content
+    : "";
+  const finishReason = typeof choice?.finish_reason === "string"
+    ? choice.finish_reason
+    : "";
+  return {
+    content,
+    reasoningContent,
+    done: finishReason.length > 0 || chunk.done === true,
+    error: null,
+  };
+}
+
+// 收集完整响应（用于非流式响应），不等待上游主动断开；读到 done 即返回
 async function collectFullResponse(
-  body: ReadableStream<Uint8Array>
-): Promise<string> {
+  body: ReadableStream<Uint8Array>,
+): Promise<{ content: string; reasoningContent: string }> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  let fullContent = "";
+  let content = "";
+  let reasoningContent = "";
 
   try {
     while (true) {
@@ -4922,30 +7990,35 @@ async function collectFullResponse(
           if (dataStr === "") continue;
 
           try {
-            const upstreamData = JSON.parse(dataStr) as UpstreamData;
-            const errObj = getUpstreamErrorFromChunk(upstreamData);
+            const parsedChunk = JSON.parse(dataStr) as unknown;
+            const pieces = extractResponsePiecesFromUnknownChunk(parsedChunk);
+            const errObj = pieces.error;
             if (errObj) {
               throw new Error(`UPSTREAM_SSE_ERROR:${JSON.stringify(errObj)}`);
             }
 
-            if (upstreamData.data.delta_content !== "") {
-              let out = upstreamData.data.delta_content;
-              if (upstreamData.data.phase === "thinking") {
-                out = transformThinking(out);
-              }
-
-              if (out !== "") {
-                fullContent += out;
-              }
+            if (pieces.content) {
+              content += pieces.content;
+            }
+            if (pieces.reasoningContent) {
+              reasoningContent += pieces.reasoningContent;
             }
 
             // 检查是否结束
-            if (upstreamData.data.done || upstreamData.data.phase === "done") {
+            if (pieces.done) {
               debugLog("检测到完成信号，停止收集");
-              return fullContent;
+              return { content, reasoningContent };
             }
           } catch (error) {
-            // 忽略解析错误
+            const message = String(error && (error as Error).message || error);
+            if (message.startsWith("UPSTREAM_SSE_ERROR:")) {
+              throw error;
+            }
+            debugLog(
+              "非流式 SSE 数据解析失败，忽略该片段: %s snippet=%s",
+              message,
+              dataStr.slice(0, 240),
+            );
           }
         }
       }
@@ -4954,31 +8027,7 @@ async function collectFullResponse(
     reader.releaseLock();
   }
 
-  return fullContent;
-}
-
-function collectFullResponseFromText(rawText: string): string {
-  let fullContent = "";
-  for (const line of rawText.split(/\r?\n/)) {
-    if (!line.startsWith("data: ")) continue;
-    const dataStr = line.substring(6).trim();
-    if (!dataStr || dataStr === "[DONE]") continue;
-    const upstreamData = JSON.parse(dataStr) as UpstreamData;
-    const errObj = getUpstreamErrorFromChunk(upstreamData);
-    if (errObj) {
-      throw new Error(`UPSTREAM_SSE_ERROR:${JSON.stringify(errObj)}`);
-    }
-    const delta = upstreamData.data.delta_content;
-    if (delta) {
-      fullContent += upstreamData.data.phase === "thinking"
-        ? transformThinking(delta)
-        : delta;
-    }
-    if (upstreamData.data.done || upstreamData.data.phase === "done") {
-      return fullContent;
-    }
-  }
-  return fullContent;
+  return { content, reasoningContent };
 }
 
 /**
@@ -5838,17 +8887,23 @@ async function handleInternalSessionState(request: Request): Promise<Response> {
   }
 
   if (request.method === "GET") {
-    return new Response(JSON.stringify({
-      ok: true,
-      state: getCaptchaSessionSnapshot(),
-    }), { status: 200, headers });
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        state: getCaptchaSessionSnapshot(),
+      }),
+      { status: 200, headers },
+    );
   }
 
   if (request.method !== "POST") {
-    return new Response(JSON.stringify({ ok: false, error: "method_not_allowed" }), {
-      status: 405,
-      headers,
-    });
+    return new Response(
+      JSON.stringify({ ok: false, error: "method_not_allowed" }),
+      {
+        status: 405,
+        headers,
+      },
+    );
   }
 
   const body = await request.json().catch(() => ({}));
@@ -5856,28 +8911,33 @@ async function handleInternalSessionState(request: Request): Promise<Response> {
     ? body.captcha_verify_param.trim()
     : null;
   const token = typeof body?.token === "string" ? body.token.trim() : null;
-  const source = typeof body?.source === "string" ? body.source.trim() : "manual";
+  const source = typeof body?.source === "string"
+    ? body.source.trim()
+    : "manual";
 
   if (captchaVerifyParam) {
-    updateCaptchaSessionState({
+    updateCaptchaSessionState(token || "anonymous", {
       captchaVerifyParam,
-      token,
       source,
     });
   } else if (token) {
-    updateCaptchaSessionState({
-      token,
+    updateCaptchaSessionState(token, {
       source,
     });
   }
 
-  return new Response(JSON.stringify({
-    ok: true,
-    state: getCaptchaSessionSnapshot(),
-  }), { status: 200, headers });
+  return new Response(
+    JSON.stringify({
+      ok: true,
+      state: getCaptchaSessionSnapshot(),
+    }),
+    { status: 200, headers },
+  );
 }
 
-async function handleInternalPureCodeWorker(request: Request): Promise<Response> {
+async function handleInternalPureCodeWorker(
+  request: Request,
+): Promise<Response> {
   const headers = new Headers();
   setCORSHeaders(headers);
   headers.set("Content-Type", "application/json; charset=utf-8");
@@ -5897,20 +8957,26 @@ async function handleInternalPureCodeWorker(request: Request): Promise<Response>
   try {
     if (request.method === "GET") {
       const status = await pureCodeWorkerBridge.status().catch(() => null);
-      return new Response(JSON.stringify({
-        ok: true,
-        enabled: AUTO_CAPTCHA_PURE_CODE_ENABLED,
-        bridge: pureCodeWorkerBridge.snapshot(),
-        worker: status,
-        session: getCaptchaSessionSnapshot(),
-      }), { status: 200, headers });
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          enabled: AUTO_CAPTCHA_PURE_CODE_ENABLED,
+          bridge: pureCodeWorkerBridge.snapshot(),
+          worker: status,
+          session: getCaptchaSessionSnapshot(),
+        }),
+        { status: 200, headers },
+      );
     }
 
     if (request.method !== "POST") {
-      return new Response(JSON.stringify({ ok: false, error: "method_not_allowed" }), {
-        status: 405,
-        headers,
-      });
+      return new Response(
+        JSON.stringify({ ok: false, error: "method_not_allowed" }),
+        {
+          status: 405,
+          headers,
+        },
+      );
     }
 
     const body = await request.json().catch(() => ({}));
@@ -5936,34 +9002,1697 @@ async function handleInternalPureCodeWorker(request: Request): Promise<Response>
       const token = typeof body?.token === "string" ? body.token : "";
       const payload = await pureCodeWorkerBridge.fetchCaptchaPayload(token);
       if (typeof payload?.captcha_verify_param === "string") {
-        updateCaptchaSessionState({
+        updateCaptchaSessionState(token || "anonymous", {
           captchaVerifyParam: payload.captcha_verify_param,
-          token,
           source: "internal-pure-code-worker",
-          workerLastPayloadSource: typeof payload?.source === "string" ? payload.source : null,
+          workerLastPayloadSource: typeof payload?.source === "string"
+            ? payload.source
+            : null,
           workerLastError: null,
         });
       }
-      return new Response(JSON.stringify({
-        ok: true,
-        action,
-        payload,
-        session: getCaptchaSessionSnapshot(),
-      }), { status: 200, headers });
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          action,
+          payload,
+          session: getCaptchaSessionSnapshot(),
+        }),
+        { status: 200, headers },
+      );
     }
 
     const result = await pureCodeWorkerBridge.status();
-    return new Response(JSON.stringify({ ok: true, action: "status", result }), {
-      status: 200,
-      headers,
+    return new Response(
+      JSON.stringify({ ok: true, action: "status", result }),
+      {
+        status: 200,
+        headers,
+      },
+    );
+  } catch (error) {
+    return new Response(
+      JSON.stringify({
+        ok: false,
+        error: String(error && (error as Error).stack || error),
+        bridge: pureCodeWorkerBridge.snapshot(),
+      }),
+      { status: 500, headers },
+    );
+  }
+}
+
+function buildProviderAuthHeaders(
+  provider: AIProviderConfig,
+): Record<string, string> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+
+  if (provider.authScheme === "none") {
+    return headers;
+  }
+
+  if (!provider.apiKey) {
+    return headers;
+  }
+
+  if (provider.authScheme === "x-api-key") {
+    headers[provider.apiKeyHeader || "x-api-key"] = provider.apiKey;
+    return headers;
+  }
+
+  headers[provider.apiKeyHeader || "Authorization"] =
+    `Bearer ${provider.apiKey}`;
+  return headers;
+}
+
+function providerNeedsApiKey(provider: AIProviderConfig): boolean {
+  return provider.authScheme !== "none" && !provider.apiKey;
+}
+
+function getOpenAICompatibleChatUrl(provider: AIProviderConfig): string {
+  const baseUrl = stripTrailingSlash(provider.baseUrl);
+  return baseUrl.endsWith("/chat/completions")
+    ? baseUrl
+    : `${baseUrl}/chat/completions`;
+}
+
+function normalizeOpenAICompatibleRequest(
+  req: OpenAIRequest,
+  resolution: AIProviderResolution,
+): Record<string, unknown> {
+  return {
+    ...req,
+    model: resolution.upstreamModel,
+    stream: req.stream === true,
+  };
+}
+
+function parseToolArguments(argumentsText: string): Record<string, unknown> {
+  if (!argumentsText.trim()) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(argumentsText);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : { value: parsed };
+  } catch (_) {
+    return { raw_arguments: argumentsText };
+  }
+}
+
+function messageContentToText(content: Message["content"]): string {
+  if (content === null) {
+    return "";
+  }
+
+  if (typeof content === "string") {
+    return content;
+  }
+
+  return content.map((block) => {
+    if (block.type === "text") return block.text || "";
+    if (block.type === "image_url") {
+      return `[image: ${block.image_url?.url || ""}]`;
+    }
+    if (block.type === "video_url") {
+      return `[video: ${block.video_url?.url || ""}]`;
+    }
+    if (block.type === "document_url") {
+      return `[document: ${block.document_url?.url || ""}]`;
+    }
+    if (block.type === "audio_url") {
+      return `[audio: ${block.audio_url?.url || ""}]`;
+    }
+    return "";
+  }).filter(Boolean).join("\n");
+}
+
+function buildAnthropicMessageContent(message: Message): unknown {
+  if (message.role === "tool") {
+    return [{
+      type: "tool_result",
+      tool_use_id: message.tool_call_id || "",
+      content: messageContentToText(message.content),
+    }];
+  }
+
+  const blocks: Array<Record<string, unknown>> = [];
+  const text = messageContentToText(message.content);
+  if (text) {
+    blocks.push({ type: "text", text });
+  }
+
+  if (message.role === "assistant" && message.tool_calls?.length) {
+    for (const toolCall of message.tool_calls) {
+      blocks.push({
+        type: "tool_use",
+        id: toolCall.id,
+        name: toolCall.function.name,
+        input: parseToolArguments(toolCall.function.arguments),
+      });
+    }
+  }
+
+  if (blocks.length === 0) {
+    return "";
+  }
+
+  if (blocks.length === 1 && blocks[0].type === "text") {
+    return blocks[0].text || "";
+  }
+
+  return blocks;
+}
+
+function normalizeAnthropicRole(role: string): "user" | "assistant" {
+  return role === "assistant" ? "assistant" : "user";
+}
+
+function buildAnthropicRequest(
+  req: OpenAIRequest,
+  resolution: AIProviderResolution,
+): Record<string, unknown> {
+  const systemMessages = req.messages
+    .filter((message) => message.role === "system")
+    .map((message) => messageContentToText(message.content))
+    .filter(Boolean)
+    .join("\n\n");
+  const messages = req.messages
+    .filter((message) => message.role !== "system")
+    .map((message) => ({
+      role: normalizeAnthropicRole(message.role),
+      content: buildAnthropicMessageContent(message),
+    }));
+
+  const body: Record<string, unknown> = {
+    model: resolution.upstreamModel,
+    messages,
+    max_tokens: Math.max(1, Math.floor(req.max_tokens || 4096)),
+    stream: req.stream === true,
+  };
+  if (systemMessages) body.system = systemMessages;
+  if (typeof req.temperature === "number") body.temperature = req.temperature;
+  if (typeof req.top_p === "number") body.top_p = req.top_p;
+  if (req.tools?.length) {
+    body.tools = req.tools.map((tool) => ({
+      name: tool.function.name,
+      description: tool.function.description,
+      input_schema: tool.function.parameters,
+    }));
+  }
+  if (req.tool_choice && req.tool_choice !== "none") {
+    if (req.tool_choice === "auto") {
+      body.tool_choice = { type: "auto" };
+    } else if (req.tool_choice === "required") {
+      body.tool_choice = { type: "any" };
+    } else {
+      body.tool_choice = { type: "tool", name: req.tool_choice.function.name };
+    }
+  }
+  return body;
+}
+
+function getAnthropicChatUrl(provider: AIProviderConfig): string {
+  const baseUrl = stripTrailingSlash(provider.baseUrl);
+  return baseUrl.endsWith("/messages") ? baseUrl : `${baseUrl}/messages`;
+}
+
+function buildAnthropicHeaders(
+  provider: AIProviderConfig,
+): Record<string, string> {
+  return {
+    ...buildProviderAuthHeaders(provider),
+    "anthropic-version": Deno.env.get("ANTHROPIC_VERSION") || "2023-06-01",
+  };
+}
+
+function anthropicToOpenAIResponse(
+  upstream: Record<string, any>,
+  requestedModel: string,
+): OpenAIResponse {
+  const content = Array.isArray(upstream.content)
+    ? upstream.content
+      .filter((item: any) => item?.type === "text")
+      .map((item: any) => item?.text || "")
+      .join("")
+    : "";
+  const toolCalls: ToolCall[] = Array.isArray(upstream.content)
+    ? upstream.content
+      .filter((item: any) => item?.type === "tool_use")
+      .map((item: any) => ({
+        id: String(item.id || crypto.randomUUID()),
+        type: "function" as const,
+        function: {
+          name: String(item.name || ""),
+          arguments: JSON.stringify(item.input || {}),
+        },
+      }))
+    : [];
+  const inputTokens = Number(upstream.usage?.input_tokens || 0);
+  const outputTokens = Number(upstream.usage?.output_tokens || 0);
+  const finishReason = upstream.stop_reason === "tool_use" || toolCalls.length
+    ? "tool_calls"
+    : upstream.stop_reason || "stop";
+  return {
+    id: upstream.id || `chatcmpl-${Date.now()}`,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: requestedModel,
+    choices: [{
+      index: 0,
+      message: {
+        role: "assistant",
+        content: content || null,
+        ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
+      },
+      finish_reason: finishReason,
+    }],
+    usage: {
+      prompt_tokens: inputTokens,
+      completion_tokens: outputTokens,
+      total_tokens: inputTokens + outputTokens,
+    },
+  };
+}
+
+function openAIStreamChunk(
+  id: string,
+  model: string,
+  delta: Delta,
+  finishReason?: string,
+): string {
+  return `data: ${
+    JSON.stringify({
+      id,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model,
+      choices: [{ index: 0, delta, finish_reason: finishReason || null }],
+    })
+  }\n\n`;
+}
+
+async function streamAnthropicAsOpenAI(
+  upstreamResponse: Response,
+  requestedModel: string,
+): Promise<Response> {
+  const headers = new Headers({
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+  });
+  setCORSHeaders(headers);
+  headers.set("X-ZtoApi-Provider", "anthropic");
+  headers.set("X-ZtoApi-Model", requestedModel);
+
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const encoder = new TextEncoder();
+      const decoder = new TextDecoder();
+      const id = `chatcmpl-${Date.now()}`;
+      const toolCallIndexes = new Map<number, number>();
+      let nextToolCallIndex = 0;
+      controller.enqueue(
+        encoder.encode(
+          openAIStreamChunk(id, requestedModel, { role: "assistant" }),
+        ),
+      );
+      const reader = upstreamResponse.body?.getReader();
+      if (!reader) {
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+        return;
+      }
+
+      let buffer = "";
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const events = buffer.split("\n\n");
+          buffer = events.pop() || "";
+          for (const event of events) {
+            for (const line of event.split("\n")) {
+              if (!line.startsWith("data:")) continue;
+              const payload = line.slice(5).trim();
+              if (!payload || payload === "[DONE]") continue;
+              try {
+                const parsed = JSON.parse(payload);
+                if (parsed.type === "content_block_start") {
+                  const contentIndex = Number(parsed.index || 0);
+                  const block = parsed.content_block;
+                  if (block?.type === "tool_use") {
+                    const toolIndex = nextToolCallIndex++;
+                    toolCallIndexes.set(contentIndex, toolIndex);
+                    controller.enqueue(encoder.encode(openAIStreamChunk(
+                      id,
+                      requestedModel,
+                      {
+                        tool_calls: [{
+                          index: toolIndex,
+                          id: String(block.id || crypto.randomUUID()),
+                          type: "function",
+                          function: {
+                            name: String(block.name || ""),
+                            arguments: "",
+                          },
+                        }],
+                      },
+                    )));
+                  }
+                } else if (
+                  parsed.type === "content_block_delta" && parsed.delta?.text
+                ) {
+                  controller.enqueue(encoder.encode(openAIStreamChunk(
+                    id,
+                    requestedModel,
+                    { content: parsed.delta.text },
+                  )));
+                } else if (
+                  parsed.type === "content_block_delta" &&
+                  parsed.delta?.type === "input_json_delta"
+                ) {
+                  const contentIndex = Number(parsed.index || 0);
+                  const toolIndex = toolCallIndexes.get(contentIndex);
+                  if (toolIndex !== undefined) {
+                    controller.enqueue(encoder.encode(openAIStreamChunk(
+                      id,
+                      requestedModel,
+                      {
+                        tool_calls: [{
+                          index: toolIndex,
+                          function: {
+                            arguments: String(parsed.delta.partial_json || ""),
+                          },
+                        }],
+                      },
+                    )));
+                  }
+                } else if (
+                  parsed.type === "message_delta" && parsed.delta?.stop_reason
+                ) {
+                  const finishReason = parsed.delta.stop_reason === "tool_use"
+                    ? "tool_calls"
+                    : parsed.delta.stop_reason;
+                  controller.enqueue(encoder.encode(openAIStreamChunk(
+                    id,
+                    requestedModel,
+                    {},
+                    finishReason,
+                  )));
+                } else if (parsed.type === "message_stop") {
+                  controller.enqueue(encoder.encode(openAIStreamChunk(
+                    id,
+                    requestedModel,
+                    {},
+                    toolCallIndexes.size ? "tool_calls" : "stop",
+                  )));
+                }
+              } catch (error) {
+                debugLog("Anthropic stream chunk parse failed: %v", error);
+              }
+            }
+          }
+        }
+      } finally {
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      }
+    },
+  });
+
+  return new Response(stream, { status: 200, headers });
+}
+
+async function handleGenericAIProviderChatCompletions(
+  request: Request,
+  req: OpenAIRequest,
+  resolution: AIProviderResolution,
+  startTime: number,
+  path: string,
+  userAgent: string,
+): Promise<Response> {
+  const headers = new Headers();
+  setCORSHeaders(headers);
+  const provider = resolution.provider;
+  headers.set("X-ZtoApi-Provider", provider.id);
+  headers.set("X-ZtoApi-Model", resolution.exposedModelId);
+
+  if (!provider.baseUrl) {
+    headers.set("Content-Type", "application/json");
+    const duration = Date.now() - startTime;
+    recordRequestStats(startTime, path, 502);
+    addLiveRequest(
+      request.method,
+      path,
+      502,
+      duration,
+      userAgent,
+      resolution.exposedModelId,
+    );
+    return new Response(
+      JSON.stringify({
+        error:
+          `Provider ${provider.id} requires ${provider.envPrefix}_BASE_URL`,
+      }),
+      { status: 502, headers },
+    );
+  }
+
+  if (!resolution.upstreamModel.trim()) {
+    headers.set("Content-Type", "application/json");
+    const duration = Date.now() - startTime;
+    recordRequestStats(startTime, path, 400);
+    addLiveRequest(
+      request.method,
+      path,
+      400,
+      duration,
+      userAgent,
+      resolution.exposedModelId,
+    );
+    return new Response(
+      JSON.stringify({ error: `Missing model for provider ${provider.id}` }),
+      { status: 400, headers },
+    );
+  }
+
+  if (providerNeedsApiKey(provider)) {
+    headers.set("Content-Type", "application/json");
+    const duration = Date.now() - startTime;
+    recordRequestStats(startTime, path, 502);
+    addLiveRequest(
+      request.method,
+      path,
+      502,
+      duration,
+      userAgent,
+      resolution.exposedModelId,
+    );
+    return new Response(
+      JSON.stringify({
+        error: `Provider ${provider.id} requires ${provider.envPrefix}_API_KEY`,
+      }),
+      { status: 502, headers },
+    );
+  }
+
+  const targetUrl = provider.kind === "anthropic"
+    ? getAnthropicChatUrl(provider)
+    : getOpenAICompatibleChatUrl(provider);
+  const providerHeaders = provider.kind === "anthropic"
+    ? buildAnthropicHeaders(provider)
+    : buildProviderAuthHeaders(provider);
+  const providerBody = provider.kind === "anthropic"
+    ? buildAnthropicRequest(req, resolution)
+    : normalizeOpenAICompatibleRequest(req, resolution);
+
+  try {
+    const upstreamResponse = await fetch(targetUrl, {
+      method: "POST",
+      headers: providerHeaders,
+      body: JSON.stringify(providerBody),
+    });
+
+    if (provider.kind === "anthropic") {
+      if (req.stream === true && upstreamResponse.ok) {
+        const duration = Date.now() - startTime;
+        recordRequestStats(startTime, path, upstreamResponse.status);
+        addLiveRequest(
+          request.method,
+          path,
+          upstreamResponse.status,
+          duration,
+          userAgent,
+          resolution.exposedModelId,
+        );
+        return await streamAnthropicAsOpenAI(
+          upstreamResponse,
+          resolution.exposedModelId,
+        );
+      }
+      const upstreamJson = await upstreamResponse.json().catch(() => null);
+      const duration = Date.now() - startTime;
+      recordRequestStats(startTime, path, upstreamResponse.status);
+      addLiveRequest(
+        request.method,
+        path,
+        upstreamResponse.status,
+        duration,
+        userAgent,
+        resolution.exposedModelId,
+      );
+      headers.set("Content-Type", "application/json");
+      if (!upstreamResponse.ok || !upstreamJson) {
+        return new Response(
+          JSON.stringify(
+            upstreamJson || { error: "Anthropic provider request failed" },
+          ),
+          {
+            status: upstreamResponse.status,
+            headers,
+          },
+        );
+      }
+      return new Response(
+        JSON.stringify(
+          anthropicToOpenAIResponse(upstreamJson, resolution.exposedModelId),
+        ),
+        {
+          status: 200,
+          headers,
+        },
+      );
+    }
+
+    const responseHeaders = new Headers(upstreamResponse.headers);
+    setCORSHeaders(responseHeaders);
+    responseHeaders.set("X-ZtoApi-Provider", provider.id);
+    responseHeaders.set("X-ZtoApi-Model", resolution.exposedModelId);
+    const duration = Date.now() - startTime;
+    recordRequestStats(startTime, path, upstreamResponse.status);
+    addLiveRequest(
+      request.method,
+      path,
+      upstreamResponse.status,
+      duration,
+      userAgent,
+      resolution.exposedModelId,
+    );
+    return new Response(upstreamResponse.body, {
+      status: upstreamResponse.status,
+      headers: responseHeaders,
     });
   } catch (error) {
-    return new Response(JSON.stringify({
-      ok: false,
-      error: String(error && (error as Error).stack || error),
-      bridge: pureCodeWorkerBridge.snapshot(),
-    }), { status: 500, headers });
+    debugLog("Provider %s request failed: %v", provider.id, error);
+    headers.set("Content-Type", "application/json");
+    const duration = Date.now() - startTime;
+    recordRequestStats(startTime, path, 502);
+    addLiveRequest(
+      request.method,
+      path,
+      502,
+      duration,
+      userAgent,
+      resolution.exposedModelId,
+    );
+    return new Response(
+      JSON.stringify({ error: `Provider ${provider.id} request failed` }),
+      { status: 502, headers },
+    );
   }
+}
+
+function responseInputPartToText(part: Record<string, any>): string {
+  if (typeof part.text === "string") return part.text;
+  if (typeof part.output_text === "string") return part.output_text;
+  if (typeof part.input_text === "string") return part.input_text;
+  if (typeof part.content === "string") return part.content;
+  return "";
+}
+
+function responseContentToMessageContent(content: unknown): Message["content"] {
+  if (content === null || content === undefined) return "";
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    const blocks: Array<{
+      type: string;
+      text?: string;
+      image_url?: { url: string };
+      video_url?: { url: string };
+      document_url?: { url: string };
+      audio_url?: { url: string };
+    }> = [];
+    for (const part of content) {
+      if (!part || typeof part !== "object") continue;
+      const record = part as Record<string, any>;
+      const text = responseInputPartToText(record);
+      if (text) {
+        blocks.push({ type: "text", text });
+        continue;
+      }
+      if (record.type === "input_image" && record.image_url) {
+        blocks.push({
+          type: "image_url",
+          image_url: { url: String(record.image_url) },
+        });
+      }
+    }
+    if (blocks.length === 1 && blocks[0]?.type === "text") {
+      return blocks[0].text || "";
+    }
+    return blocks;
+  }
+  return JSON.stringify(content);
+}
+
+function normalizeResponsesTool(tool: Record<string, any>): Tool | null {
+  if (tool.type === "function" && tool.function?.name) {
+    return {
+      type: "function",
+      function: {
+        name: String(tool.function.name),
+        description: tool.function.description,
+        parameters: tool.function.parameters || {},
+      },
+    };
+  }
+  if (tool.type === "function" && tool.name) {
+    return {
+      type: "function",
+      function: {
+        name: String(tool.name),
+        description: tool.description,
+        parameters: tool.parameters || {},
+      },
+    };
+  }
+  return null;
+}
+
+function normalizeResponsesToolChoice(
+  toolChoice: ResponsesRequest["tool_choice"],
+): ToolChoice | undefined {
+  if (!toolChoice) return undefined;
+  if (
+    toolChoice === "none" || toolChoice === "auto" || toolChoice === "required"
+  ) {
+    return toolChoice;
+  }
+  if (typeof toolChoice === "object") {
+    const record = toolChoice as Record<string, any>;
+    const name = typeof record.name === "string"
+      ? record.name
+      : typeof record.function?.name === "string"
+      ? record.function.name
+      : "";
+    if (name) return { type: "function", function: { name } };
+  }
+  return undefined;
+}
+
+function responsesInputToMessages(input: unknown): Message[] {
+  if (input === undefined || input === null) return [];
+  if (typeof input === "string") return [{ role: "user", content: input }];
+  if (!Array.isArray(input)) {
+    return [{ role: "user", content: responseContentToMessageContent(input) }];
+  }
+
+  const messages: Message[] = [];
+  for (const item of input) {
+    if (!item || typeof item !== "object") {
+      messages.push({ role: "user", content: String(item ?? "") });
+      continue;
+    }
+    const record = item as Record<string, any>;
+    if (record.type === "function_call_output") {
+      messages.push({
+        role: "tool",
+        tool_call_id: String(record.call_id || record.id || ""),
+        content: typeof record.output === "string"
+          ? record.output
+          : JSON.stringify(record.output ?? ""),
+      });
+      continue;
+    }
+    if (record.type === "function_call") {
+      messages.push({
+        role: "assistant",
+        content: null,
+        tool_calls: [{
+          id: String(record.call_id || record.id || createToolCallId()),
+          type: "function",
+          function: {
+            name: String(record.name || ""),
+            arguments: toolArgumentsToString(record.arguments || {}),
+          },
+        }],
+      });
+      continue;
+    }
+    const role = typeof record.role === "string" ? record.role : "user";
+    messages.push({
+      role,
+      content: responseContentToMessageContent(
+        record.content ?? record.text ?? "",
+      ),
+    });
+  }
+  return messages;
+}
+
+function responsesRequestToChatRequest(
+  req: ResponsesRequest,
+  resolvedConversationId = "",
+): OpenAIRequest {
+  const messages = responsesInputToMessages(req.input);
+  if (req.instructions) {
+    messages.unshift({ role: "system", content: req.instructions });
+  }
+  return {
+    model: req.model,
+    messages: messages.length ? messages : [{ role: "user", content: "" }],
+    stream: false,
+    temperature: req.temperature,
+    top_p: req.top_p,
+    max_tokens: req.max_output_tokens || req.max_tokens,
+    tools: req.tools?.map(normalizeResponsesTool).filter(Boolean) as
+      | Tool[]
+      | undefined,
+    tool_choice: normalizeResponsesToolChoice(req.tool_choice),
+    conversation_id: resolvedConversationId,
+  };
+}
+
+function chatResponseToResponsesPayload(
+  chat: OpenAIResponse,
+  requestedModel: string,
+  responseId = `resp_${crypto.randomUUID().replace(/-/g, "")}`,
+): Record<string, unknown> {
+  const choice = chat.choices?.[0] || {};
+  const message = choice.message || { role: "assistant", content: "" };
+  const output: Array<Record<string, unknown>> = [];
+
+  if (message.tool_calls?.length) {
+    for (const toolCall of message.tool_calls) {
+      output.push({
+        type: "function_call",
+        id: `fc_${toolCall.id}`,
+        call_id: toolCall.id,
+        name: toolCall.function.name,
+        arguments: toolCall.function.arguments,
+        status: "completed",
+      });
+    }
+  } else {
+    output.push({
+      type: "message",
+      id: `msg_${crypto.randomUUID().replace(/-/g, "")}`,
+      status: "completed",
+      role: "assistant",
+      content: [{
+        type: "output_text",
+        text: messageContentToText(message.content),
+        annotations: [],
+      }],
+    });
+  }
+
+  const outputText = output
+    .filter((item) => item.type === "message")
+    .flatMap((item: any) => item.content || [])
+    .filter((item: any) => item.type === "output_text")
+    .map((item: any) => item.text || "")
+    .join("");
+
+  return {
+    id: responseId,
+    object: "response",
+    created_at: Math.floor(Date.now() / 1000),
+    status: "completed",
+    model: requestedModel,
+    output,
+    output_text: outputText,
+    usage: chat.usage,
+  };
+}
+
+function responsesPayloadToStream(payload: Record<string, unknown>): Response {
+  const encoder = new TextEncoder();
+  const headers = new Headers({
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+  });
+  setCORSHeaders(headers);
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const send = (event: string, data: unknown) => {
+        controller.enqueue(
+          encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`),
+        );
+      };
+      send("response.created", payload);
+      let outputIndex = 0;
+      for (
+        const item of (payload.output as Array<Record<string, unknown>>) || []
+      ) {
+        const itemIndex = outputIndex++;
+        send("response.output_item.added", { item, output_index: itemIndex });
+        if (item.type === "message") {
+          const content = Array.isArray(item.content)
+            ? item.content as Array<Record<string, unknown>>
+            : [];
+          for (
+            let contentIndex = 0;
+            contentIndex < content.length;
+            contentIndex++
+          ) {
+            const part = content[contentIndex];
+            send("response.content_part.added", {
+              item_id: item.id,
+              output_index: itemIndex,
+              content_index: contentIndex,
+              part,
+            });
+            const text = typeof part.text === "string" ? part.text : "";
+            if (text) {
+              send("response.output_text.delta", {
+                item_id: item.id,
+                output_index: itemIndex,
+                content_index: contentIndex,
+                delta: text,
+              });
+            }
+            send("response.content_part.done", {
+              item_id: item.id,
+              output_index: itemIndex,
+              content_index: contentIndex,
+              part,
+            });
+          }
+        } else if (item.type === "function_call") {
+          const argumentsText = typeof item.arguments === "string"
+            ? item.arguments
+            : JSON.stringify(item.arguments ?? {});
+          if (argumentsText) {
+            send("response.function_call_arguments.delta", {
+              item_id: item.id,
+              output_index: itemIndex,
+              delta: argumentsText,
+            });
+          }
+          send("response.function_call_arguments.done", {
+            item_id: item.id,
+            output_index: itemIndex,
+            arguments: argumentsText,
+          });
+        }
+        send("response.output_item.done", { item, output_index: itemIndex });
+      }
+      send("response.completed", payload);
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      controller.close();
+    },
+  });
+  return new Response(stream, { status: 200, headers });
+}
+
+async function handleGetResponse(
+  request: Request,
+  responseId: string,
+): Promise<Response> {
+  const headers = new Headers();
+  setCORSHeaders(headers);
+  headers.set("Content-Type", "application/json");
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 200, headers });
+  }
+  if (request.method !== "GET") {
+    return new Response("Method not allowed", { status: 405, headers });
+  }
+  cleanupStoredResponses();
+  const stored = responsesObjectStore.get(decodeURIComponent(responseId));
+  if (!stored || stored.owner !== getResponseStoreOwner(request)) {
+    return new Response(
+      buildOpenAIError(
+        `Response not found: ${responseId}`,
+        "invalid_request_error",
+        "not_found",
+      ),
+      { status: 404, headers },
+    );
+  }
+  return new Response(JSON.stringify(stored.payload), { status: 200, headers });
+}
+
+function createResponsesBasePayload(
+  responseId: string,
+  model: string,
+  status = "in_progress",
+): Record<string, unknown> {
+  return {
+    id: responseId,
+    object: "response",
+    created_at: Math.floor(Date.now() / 1000),
+    status,
+    model,
+    output: [],
+    output_text: "",
+  };
+}
+
+async function handleResponsesStream(
+  request: Request,
+  responsesReq: ResponsesRequest,
+  resolvedConversationId: string,
+): Promise<Response> {
+  const responseId = `resp_${crypto.randomUUID().replace(/-/g, "")}`;
+  responsesConversationAliases.set(responseId, resolvedConversationId);
+  const chatReq = responsesRequestToChatRequest(
+    responsesReq,
+    resolvedConversationId,
+  );
+  chatReq.stream = true;
+
+  const chatUrl = new URL(request.url);
+  chatUrl.pathname = "/v1/chat/completions";
+  const chatResponse = await handleChatCompletions(
+    new Request(chatUrl, {
+      method: "POST",
+      headers: request.headers,
+      body: JSON.stringify(chatReq),
+    }),
+  );
+  if (!chatResponse.ok || !chatResponse.body) return chatResponse;
+
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const headers = new Headers({
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+  });
+  setCORSHeaders(headers);
+
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const send = (event: string, data: unknown) => {
+        controller.enqueue(
+          encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`),
+        );
+      };
+      const sendDone = () => {
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      };
+      const output: Array<Record<string, unknown>> = [];
+      const basePayload = createResponsesBasePayload(
+        responseId,
+        responsesReq.model,
+      );
+      send("response.created", basePayload);
+
+      const messageItemId = `msg_${crypto.randomUUID().replace(/-/g, "")}`;
+      let messageItem: any = null;
+      let contentPartAdded = false;
+      let outputText = "";
+      const toolItems = new Map<
+        number,
+        {
+          item: Record<string, unknown>;
+          argumentsText: string;
+          outputIndex: number;
+        }
+      >();
+      const reader = chatResponse.body!.getReader();
+      let buffer = "";
+
+      const ensureMessageItem = () => {
+        if (messageItem) return;
+        messageItem = {
+          type: "message",
+          id: messageItemId,
+          status: "in_progress",
+          role: "assistant",
+          content: [],
+        };
+        output.push(messageItem);
+        send("response.output_item.added", {
+          item: messageItem,
+          output_index: output.length - 1,
+        });
+      };
+      const ensureContentPart = () => {
+        ensureMessageItem();
+        if (contentPartAdded) return;
+        send("response.content_part.added", {
+          item_id: messageItemId,
+          output_index: 0,
+          content_index: 0,
+          part: { type: "output_text", text: "", annotations: [] },
+        });
+        contentPartAdded = true;
+      };
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const events = buffer.split("\n\n");
+          buffer = events.pop() || "";
+          for (const event of events) {
+            for (const line of event.split("\n")) {
+              if (!line.startsWith("data:")) continue;
+              const dataStr = line.slice(5).trim();
+              if (!dataStr || dataStr === "[DONE]") continue;
+              const chunk = JSON.parse(dataStr) as OpenAIResponse;
+              const choice = chunk.choices?.[0];
+              const delta = choice?.delta || {};
+              if (typeof delta.content === "string" && delta.content) {
+                ensureContentPart();
+                outputText += delta.content;
+                send("response.output_text.delta", {
+                  item_id: messageItemId,
+                  output_index: 0,
+                  content_index: 0,
+                  delta: delta.content,
+                });
+              }
+              for (const toolDelta of delta.tool_calls || []) {
+                const toolIndex = Number(toolDelta.index || 0);
+                let state = toolItems.get(toolIndex);
+                if (!state) {
+                  const callId = toolDelta.id || createToolCallId();
+                  const item = {
+                    type: "function_call",
+                    id: `fc_${callId}`,
+                    call_id: callId,
+                    name: toolDelta.function?.name || "",
+                    arguments: "",
+                    status: "in_progress",
+                  };
+                  output.push(item);
+                  state = {
+                    item,
+                    argumentsText: "",
+                    outputIndex: output.length - 1,
+                  };
+                  toolItems.set(toolIndex, state);
+                  send("response.output_item.added", {
+                    item,
+                    output_index: state.outputIndex,
+                  });
+                }
+                if (toolDelta.function?.name) {
+                  state.item.name = toolDelta.function.name;
+                }
+                if (toolDelta.function?.arguments) {
+                  state.argumentsText += toolDelta.function.arguments;
+                  state.item.arguments = state.argumentsText;
+                  send("response.function_call_arguments.delta", {
+                    item_id: state.item.id,
+                    output_index: state.outputIndex,
+                    delta: toolDelta.function.arguments,
+                  });
+                }
+              }
+            }
+          }
+        }
+        if (contentPartAdded && messageItem) {
+          const part = {
+            type: "output_text",
+            text: outputText,
+            annotations: [],
+          };
+          messageItem.status = "completed";
+          messageItem.content = [part];
+          send("response.content_part.done", {
+            item_id: messageItemId,
+            output_index: 0,
+            content_index: 0,
+            part,
+          });
+          send("response.output_item.done", {
+            item: messageItem,
+            output_index: 0,
+          });
+        }
+        for (const state of toolItems.values()) {
+          state.item.status = "completed";
+          send("response.function_call_arguments.done", {
+            item_id: state.item.id,
+            output_index: state.outputIndex,
+            arguments: state.argumentsText,
+          });
+          send("response.output_item.done", {
+            item: state.item,
+            output_index: state.outputIndex,
+          });
+        }
+        const completedPayload = {
+          ...basePayload,
+          status: "completed",
+          output,
+          output_text: outputText,
+        };
+        storeResponseObject(request, completedPayload);
+        send("response.completed", completedPayload);
+        sendDone();
+      } catch (error) {
+        send("response.failed", {
+          ...basePayload,
+          status: "failed",
+          error: {
+            message: String(error && (error as Error).message || error),
+            type: "server_error",
+          },
+        });
+        sendDone();
+      } finally {
+        reader.releaseLock();
+        controller.close();
+      }
+    },
+  });
+  return new Response(stream, { status: 200, headers });
+}
+
+function anthropicSystemToText(
+  system: AnthropicMessagesRequest["system"],
+): string {
+  if (!system) return "";
+  if (typeof system === "string") return system;
+  return system.map((item) => {
+    if (!item || typeof item !== "object") return "";
+    if (typeof item.text === "string") return item.text;
+    if (typeof item.content === "string") return item.content;
+    return "";
+  }).filter(Boolean).join("\n\n");
+}
+
+function anthropicContentToText(content: AnthropicMessage["content"]): string {
+  if (typeof content === "string") return content;
+  return content.map((part) => {
+    if (!part || typeof part !== "object") return "";
+    if (part.type === "text" && typeof part.text === "string") return part.text;
+    if (typeof part.content === "string") return part.content;
+    return "";
+  }).filter(Boolean).join("\n");
+}
+
+function normalizeAnthropicTool(tool: Record<string, any>): Tool | null {
+  const name = typeof tool.name === "string"
+    ? tool.name
+    : typeof tool.function?.name === "string"
+    ? tool.function.name
+    : "";
+  if (!name) return null;
+  return {
+    type: "function",
+    function: {
+      name,
+      description: tool.description || tool.function?.description || "",
+      parameters: tool.input_schema || tool.parameters ||
+        tool.function?.parameters || {},
+    },
+  };
+}
+
+function normalizeAnthropicToolChoice(
+  toolChoice: AnthropicMessagesRequest["tool_choice"],
+): ToolChoice | undefined {
+  if (!toolChoice) return undefined;
+  if (typeof toolChoice === "string") {
+    if (toolChoice === "none" || toolChoice === "auto") return toolChoice;
+    if (toolChoice === "any" || toolChoice === "required") return "required";
+    return undefined;
+  }
+  const type = String(toolChoice.type || "");
+  if (type === "none" || type === "auto") return type;
+  if (type === "any") return "required";
+  const name = typeof toolChoice.name === "string"
+    ? toolChoice.name
+    : typeof toolChoice.function?.name === "string"
+    ? toolChoice.function.name
+    : "";
+  return name ? { type: "function", function: { name } } : undefined;
+}
+
+function anthropicMessagesToOpenAIRequest(
+  req: AnthropicMessagesRequest,
+): OpenAIRequest {
+  const messages: Message[] = [];
+  const systemText = anthropicSystemToText(req.system);
+  if (systemText) {
+    messages.push({ role: "system", content: systemText });
+  }
+
+  for (const message of req.messages || []) {
+    if (Array.isArray(message.content)) {
+      const toolCalls: ToolCall[] = [];
+      const textParts: string[] = [];
+      for (const part of message.content) {
+        if (part.type === "text" && typeof part.text === "string") {
+          textParts.push(part.text);
+        } else if (part.type === "tool_use") {
+          toolCalls.push({
+            id: String(part.id || createToolCallId()),
+            type: "function",
+            function: {
+              name: String(part.name || ""),
+              arguments: toolArgumentsToString(part.input || {}),
+            },
+          });
+        } else if (part.type === "tool_result") {
+          messages.push({
+            role: "tool",
+            tool_call_id: String(part.tool_use_id || part.id || ""),
+            content: typeof part.content === "string"
+              ? part.content
+              : JSON.stringify(part.content ?? ""),
+          });
+        }
+      }
+      if (message.role !== "tool" && (textParts.length || toolCalls.length)) {
+        messages.push({
+          role: message.role === "assistant" ? "assistant" : "user",
+          content: textParts.join("\n") || null,
+          ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
+        });
+      }
+    } else {
+      messages.push({
+        role: message.role === "assistant" ? "assistant" : "user",
+        content: message.content,
+      });
+    }
+  }
+
+  return {
+    model: req.model,
+    messages: messages.length ? messages : [{ role: "user", content: "" }],
+    stream: false,
+    temperature: req.temperature,
+    top_p: req.top_p,
+    max_tokens: req.max_tokens,
+    tools: req.tools?.map(normalizeAnthropicTool).filter(Boolean) as
+      | Tool[]
+      | undefined,
+    tool_choice: normalizeAnthropicToolChoice(req.tool_choice),
+  };
+}
+
+function estimateTokenCountFromMessages(messages: Message[]): number {
+  const chars = messages.reduce((sum, message) => {
+    return sum + messageContentToText(message.content).length +
+      JSON.stringify(message.tool_calls || []).length;
+  }, 0);
+  return Math.max(1, Math.ceil(chars / 4));
+}
+
+function openAIChatToAnthropicMessage(
+  chat: OpenAIResponse,
+  requestedModel: string,
+): Record<string, unknown> {
+  const choice = chat.choices?.[0] || {};
+  const message = choice.message || { role: "assistant", content: "" };
+  const content: Array<Record<string, unknown>> = [];
+  const text = messageContentToText(message.content);
+  if (text) content.push({ type: "text", text });
+  for (const toolCall of message.tool_calls || []) {
+    content.push({
+      type: "tool_use",
+      id: toolCall.id,
+      name: toolCall.function.name,
+      input: parseToolArguments(toolCall.function.arguments),
+    });
+  }
+  const usage = chat.usage ||
+    { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+  return {
+    id: `msg_${crypto.randomUUID().replace(/-/g, "")}`,
+    type: "message",
+    role: "assistant",
+    model: requestedModel,
+    content,
+    stop_reason: message.tool_calls?.length ? "tool_use" : "end_turn",
+    stop_sequence: null,
+    usage: {
+      input_tokens: usage.prompt_tokens || 0,
+      output_tokens: usage.completion_tokens || 0,
+    },
+  };
+}
+
+function anthropicPayloadToStream(payload: Record<string, unknown>): Response {
+  const encoder = new TextEncoder();
+  const headers = new Headers({
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+  });
+  setCORSHeaders(headers);
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const send = (event: string, data: unknown) => {
+        controller.enqueue(
+          encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`),
+        );
+      };
+      send("message_start", { message: { ...payload, content: [] } });
+      const content = Array.isArray(payload.content)
+        ? payload.content as Array<Record<string, unknown>>
+        : [];
+      for (let index = 0; index < content.length; index++) {
+        const block = content[index];
+        send("content_block_start", { index, content_block: block });
+        if (block.type === "text" && typeof block.text === "string") {
+          send("content_block_delta", {
+            index,
+            delta: { type: "text_delta", text: block.text },
+          });
+        } else if (block.type === "tool_use") {
+          send("content_block_delta", {
+            index,
+            delta: {
+              type: "input_json_delta",
+              partial_json: JSON.stringify(block.input || {}),
+            },
+          });
+        }
+        send("content_block_stop", { index });
+      }
+      send("message_delta", {
+        delta: {
+          stop_reason: payload.stop_reason || "end_turn",
+          stop_sequence: null,
+        },
+        usage: payload.usage || { output_tokens: 0 },
+      });
+      send("message_stop", {});
+      controller.close();
+    },
+  });
+  return new Response(stream, { status: 200, headers });
+}
+
+function openAIStreamToAnthropicStream(
+  chatResponse: Response,
+  requestedModel: string,
+): Response {
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const headers = new Headers({
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+  });
+  setCORSHeaders(headers);
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const reader = chatResponse.body?.getReader();
+      const messageId = `msg_${crypto.randomUUID().replace(/-/g, "")}`;
+      const startedBlocks = new Set<number>();
+      const toolNames = new Map<number, string>();
+      let textBlockStarted = false;
+      let textBlockIndex = 0;
+      let nextBlockIndex = 1;
+      let stopReason = "end_turn";
+      const send = (event: string, data: unknown) => {
+        controller.enqueue(
+          encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`),
+        );
+      };
+      send("message_start", {
+        message: {
+          id: messageId,
+          type: "message",
+          role: "assistant",
+          model: requestedModel,
+          content: [],
+          stop_reason: null,
+          stop_sequence: null,
+          usage: { input_tokens: 0, output_tokens: 0 },
+        },
+      });
+      if (!reader) {
+        send("message_stop", {});
+        controller.close();
+        return;
+      }
+      let buffer = "";
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const events = buffer.split("\n\n");
+          buffer = events.pop() || "";
+          for (const event of events) {
+            for (const line of event.split("\n")) {
+              if (!line.startsWith("data:")) continue;
+              const dataStr = line.slice(5).trim();
+              if (!dataStr || dataStr === "[DONE]") continue;
+              const chunk = JSON.parse(dataStr) as OpenAIResponse;
+              const choice = chunk.choices?.[0];
+              const delta = choice?.delta || {};
+              if (choice?.finish_reason === "tool_calls") {
+                stopReason = "tool_use";
+              } else if (choice?.finish_reason) stopReason = "end_turn";
+              if (delta.content) {
+                if (!textBlockStarted) {
+                  textBlockStarted = true;
+                  send("content_block_start", {
+                    index: textBlockIndex,
+                    content_block: { type: "text", text: "" },
+                  });
+                }
+                send("content_block_delta", {
+                  index: textBlockIndex,
+                  delta: { type: "text_delta", text: delta.content },
+                });
+              }
+              for (const toolDelta of delta.tool_calls || []) {
+                const openAIIndex = toolDelta.index ?? 0;
+                const index = openAIIndex + nextBlockIndex;
+                const name = toolDelta.function?.name || toolNames.get(index) ||
+                  "tool";
+                toolNames.set(index, name);
+                if (!startedBlocks.has(index)) {
+                  startedBlocks.add(index);
+                  send("content_block_start", {
+                    index,
+                    content_block: {
+                      type: "tool_use",
+                      id: toolDelta.id || createToolCallId(),
+                      name,
+                      input: {},
+                    },
+                  });
+                }
+                if (toolDelta.function?.arguments) {
+                  send("content_block_delta", {
+                    index,
+                    delta: {
+                      type: "input_json_delta",
+                      partial_json: toolDelta.function.arguments,
+                    },
+                  });
+                }
+              }
+            }
+          }
+        }
+        if (textBlockStarted) {
+          send("content_block_stop", { index: textBlockIndex });
+        }
+        for (const index of Array.from(startedBlocks).sort((a, b) => a - b)) {
+          send("content_block_stop", { index });
+        }
+        send("message_delta", {
+          delta: { stop_reason: stopReason, stop_sequence: null },
+          usage: { output_tokens: 0 },
+        });
+        send("message_stop", {});
+      } catch (error) {
+        send("error", {
+          type: "error",
+          error: { type: "api_error", message: String(error) },
+        });
+      } finally {
+        reader.releaseLock();
+        controller.close();
+      }
+    },
+  });
+  return new Response(stream, { status: 200, headers });
+}
+
+async function handleAnthropicMessages(request: Request): Promise<Response> {
+  const headers = new Headers();
+  setCORSHeaders(headers);
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 200, headers });
+  }
+  if (request.method !== "POST") {
+    return new Response("Method not allowed", { status: 405, headers });
+  }
+  const authHeader = request.headers.get("Authorization") ||
+    request.headers.get("x-api-key");
+  if (
+    !validateApiKey(
+      authHeader?.startsWith("Bearer ")
+        ? authHeader
+        : `Bearer ${authHeader || ""}`,
+    )
+  ) {
+    return new Response("Missing or invalid API key", { status: 401, headers });
+  }
+  let anthropicReq: AnthropicMessagesRequest;
+  try {
+    anthropicReq = await request.json() as AnthropicMessagesRequest;
+  } catch {
+    return new Response("Invalid JSON", { status: 400, headers });
+  }
+  const chatReq = anthropicMessagesToOpenAIRequest(anthropicReq);
+  if (anthropicReq.stream === true) chatReq.stream = true;
+  const chatUrl = new URL(request.url);
+  chatUrl.pathname = "/v1/chat/completions";
+  const chatResponse = await handleChatCompletions(
+    new Request(chatUrl, {
+      method: "POST",
+      headers: request.headers,
+      body: JSON.stringify(chatReq),
+    }),
+  );
+  if (anthropicReq.stream === true) {
+    return openAIStreamToAnthropicStream(chatResponse, anthropicReq.model);
+  }
+  const chatText = await chatResponse.text();
+  if (!chatResponse.ok) {
+    headers.set("Content-Type", "application/json");
+    return new Response(chatText, { status: chatResponse.status, headers });
+  }
+  let chatJson: OpenAIResponse;
+  try {
+    chatJson = JSON.parse(chatText) as OpenAIResponse;
+  } catch {
+    return new Response(chatText, { status: 502, headers });
+  }
+  const payload = openAIChatToAnthropicMessage(chatJson, anthropicReq.model);
+  headers.set("Content-Type", "application/json");
+  return new Response(JSON.stringify(payload), { status: 200, headers });
+}
+
+async function handleAnthropicTokenCount(request: Request): Promise<Response> {
+  const headers = new Headers();
+  setCORSHeaders(headers);
+  headers.set("Content-Type", "application/json");
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 200, headers });
+  }
+  if (request.method !== "POST") {
+    return new Response("Method not allowed", { status: 405, headers });
+  }
+  const body = await request.json().catch(
+    () => ({}),
+  ) as AnthropicMessagesRequest;
+  const chatReq = anthropicMessagesToOpenAIRequest({
+    model: body.model || DEFAULT_MODEL.id,
+    messages: body.messages || [],
+    system: body.system,
+  });
+  return new Response(
+    JSON.stringify({
+      input_tokens: estimateTokenCountFromMessages(chatReq.messages),
+    }),
+    {
+      status: 200,
+      headers,
+    },
+  );
+}
+
+async function handleAnthropicModels(request: Request): Promise<Response> {
+  const headers = new Headers();
+  setCORSHeaders(headers);
+  headers.set("Content-Type", "application/json");
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 200, headers });
+  }
+  const data = listConfiguredModels().map((model) => ({
+    id: model.id,
+    type: "model",
+    display_name: model.display_name || model.id,
+    created_at: new Date(
+      (model.created || Math.floor(Date.now() / 1000)) * 1000,
+    ).toISOString(),
+  }));
+  return new Response(
+    JSON.stringify({
+      data,
+      has_more: false,
+      first_id: data[0]?.id || null,
+      last_id: data[data.length - 1]?.id || null,
+    }),
+    {
+      status: 200,
+      headers,
+    },
+  );
+}
+
+async function handleResponses(request: Request): Promise<Response> {
+  const headers = new Headers();
+  setCORSHeaders(headers);
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 200, headers });
+  }
+  if (request.method !== "POST") {
+    return new Response("Method not allowed", { status: 405, headers });
+  }
+
+  const body = await request.text();
+  let responsesReq: ResponsesRequest;
+  try {
+    responsesReq = JSON.parse(body) as ResponsesRequest;
+  } catch {
+    return new Response("Invalid JSON", { status: 400, headers });
+  }
+
+  const previousResponseId = normalizeClientConversationId(
+    responsesReq.previous_response_id,
+  );
+  const resolvedConversationId = previousResponseId
+    ? responsesConversationAliases.get(previousResponseId) || previousResponseId
+    : `responses:${crypto.randomUUID()}`;
+  if (responsesReq.stream === true) {
+    return await handleResponsesStream(
+      request,
+      responsesReq,
+      resolvedConversationId,
+    );
+  }
+  const chatReq = responsesRequestToChatRequest(
+    responsesReq,
+    resolvedConversationId,
+  );
+  const chatUrl = new URL(request.url);
+  chatUrl.pathname = "/v1/chat/completions";
+  const chatResponse = await handleChatCompletions(
+    new Request(chatUrl, {
+      method: "POST",
+      headers: request.headers,
+      body: JSON.stringify(chatReq),
+    }),
+  );
+  const chatText = await chatResponse.text();
+  if (!chatResponse.ok) {
+    headers.set("Content-Type", "application/json");
+    return new Response(chatText, { status: chatResponse.status, headers });
+  }
+  let chatJson: OpenAIResponse;
+  try {
+    chatJson = JSON.parse(chatText) as OpenAIResponse;
+  } catch {
+    return new Response(chatText, { status: 502, headers });
+  }
+  const responseId = `resp_${crypto.randomUUID().replace(/-/g, "")}`;
+  responsesConversationAliases.set(responseId, resolvedConversationId);
+  const payload = chatResponseToResponsesPayload(
+    chatJson,
+    responsesReq.model,
+    responseId,
+  );
+  storeResponseObject(request, payload);
+  headers.set("Content-Type", "application/json");
+  return new Response(JSON.stringify(payload), { status: 200, headers });
 }
 
 async function handleModels(request: Request): Promise<Response> {
@@ -5974,13 +10703,7 @@ async function handleModels(request: Request): Promise<Response> {
     return new Response(null, { status: 200, headers });
   }
 
-  // 支持的模型
-  const models = SUPPORTED_MODELS.map((model) => ({
-    id: model.name,
-    object: "model",
-    created: Math.floor(Date.now() / 1000),
-    owned_by: "z.ai",
-  }));
+  const models = listConfiguredModels();
 
   const response: ModelsResponse = {
     object: "list",
@@ -5994,6 +10717,35 @@ async function handleModels(request: Request): Promise<Response> {
   });
 }
 
+async function handleModelById(
+  request: Request,
+  modelId: string,
+): Promise<Response> {
+  const headers = new Headers();
+  setCORSHeaders(headers);
+  headers.set("Content-Type", "application/json");
+
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 200, headers });
+  }
+  if (request.method !== "GET") {
+    return new Response("Method not allowed", { status: 405, headers });
+  }
+
+  const model = findConfiguredModel(modelId);
+  if (!model) {
+    return new Response(
+      buildOpenAIError(
+        `Model not found: ${modelId}`,
+        "invalid_request_error",
+        "model_not_found",
+      ),
+      { status: 404, headers },
+    );
+  }
+  return new Response(JSON.stringify(model), { status: 200, headers });
+}
+
 async function handleChatCompletions(request: Request): Promise<Response> {
   const startTime = Date.now();
   const url = new URL(request.url);
@@ -6004,13 +10756,12 @@ async function handleChatCompletions(request: Request): Promise<Response> {
   debugLog("🌐 User-Agent: %s", userAgent);
 
   // Cherry Studio 检测
-  const isCherryStudio =
-    userAgent.toLowerCase().includes("cherry") ||
+  const isCherryStudio = userAgent.toLowerCase().includes("cherry") ||
     userAgent.toLowerCase().includes("studio");
   if (isCherryStudio) {
     debugLog(
       "🍒 检测到 Cherry Studio 客户端版本: %s",
-      userAgent.match(/CherryStudio\/([^\s]+)/)?.[1] || "unknown"
+      userAgent.match(/CherryStudio\/([^\s]+)/)?.[1] || "unknown",
     );
   }
 
@@ -6043,8 +10794,9 @@ async function handleChatCompletions(request: Request): Promise<Response> {
     debugLog("📥 收到请求体长度: %d 字符", body.length);
 
     // 为Cherry Studio调试：记录原始请求体（截取前1000字符避免日志过长）
-    const bodyPreview =
-      body.length > 1000 ? body.substring(0, 1000) + "..." : body;
+    const bodyPreview = body.length > 1000
+      ? body.substring(0, 1000) + "..."
+      : body;
     debugLog("📄 请求体预览: %s", bodyPreview);
   } catch (error) {
     debugLog("读取请求体失败: %v", error);
@@ -6079,14 +10831,34 @@ async function handleChatCompletions(request: Request): Promise<Response> {
     debugLog("客户端未指定stream参数，使用默认值: %v", DEFAULT_STREAM);
   }
 
+  const providerResolution = resolveAIProvider(req.model);
+  debugLog(
+    "AI provider resolved: requested=%s provider=%s upstream_model=%s",
+    providerResolution.requestedModel,
+    providerResolution.provider.id,
+    providerResolution.upstreamModel,
+  );
+
+  if (providerResolution.provider.id !== ZAI_PROVIDER_CONFIG.id) {
+    return await handleGenericAIProviderChatCompletions(
+      request,
+      req,
+      providerResolution,
+      startTime,
+      path,
+      userAgent,
+    );
+  }
+
   // 获取模型配置
-  const modelConfig = getModelConfig(req.model);
+  const modelConfig = getModelConfig(providerResolution.exposedModelId);
+  req.model = modelConfig.id;
   debugLog(
     "请求解析成功 - 模型: %s (%s), 流式: %v, 消息数: %d",
     req.model,
     modelConfig.name,
     req.stream,
-    req.messages.length
+    req.messages.length,
   );
 
   // Cherry Studio 调试：详细检查每条消息
@@ -6099,7 +10871,7 @@ async function handleChatCompletions(request: Request): Promise<Response> {
       debugLog(
         "  消息[%d] content: 字符串类型, 长度: %d",
         i,
-        msg.content.length
+        msg.content.length,
       );
       if (msg.content.length === 0) {
         debugLog("  ⚠️  消息[%d] 内容为空字符串!", i);
@@ -6118,7 +10890,7 @@ async function handleChatCompletions(request: Request): Promise<Response> {
             "    块[%d] image_url: %s格式, 长度: %d",
             j,
             block.image_url.url.startsWith("data:") ? "base64" : "url",
-            block.image_url.url.length
+            block.image_url.url.length,
           );
         }
       }
@@ -6130,34 +10902,63 @@ async function handleChatCompletions(request: Request): Promise<Response> {
   // 检测模型高级能力
   const capabilities = ModelCapabilityDetector.detectCapabilities(
     req.model,
-    req.reasoning
+    req.reasoning,
   );
-  debugLog("模型能力检测: 思考=%s, 搜索=%s, 高级搜索=%s, 视觉=%s, MCP=%s",
-    capabilities.thinking, capabilities.search, capabilities.advancedSearch,
-    capabilities.vision, capabilities.mcp);
+  debugLog(
+    "模型能力检测: 思考=%s, 搜索=%s, 高级搜索=%s, 视觉=%s, MCP=%s",
+    capabilities.thinking,
+    capabilities.search,
+    capabilities.advancedSearch,
+    capabilities.vision,
+    capabilities.mcp,
+  );
+
+  const inboundMessages = injectZaiToolCallBridgeInstruction(req.messages, req);
+  if (inboundMessages !== req.messages) {
+    debugLog(
+      "🔧 Z.ai tool-call bridge 已启用: tools=%d tool_choice=%s",
+      req.tools?.length || 0,
+      typeof req.tool_choice === "string"
+        ? req.tool_choice
+        : req.tool_choice?.function.name || "auto",
+    );
+  }
 
   // 处理和验证消息（特别是多模态内容）
-  const processedMessages = processMessages(req.messages, modelConfig);
+  const processedMessages = processMessages(inboundMessages, modelConfig);
   debugLog("消息处理完成，处理后消息数: %d", processedMessages.length);
 
-  // 使用 Token 池获取 token
+  // 吸收 ds2api 的双模 Token 处理机制：支持托管账号池与直连 Token 双模式
   let authToken: string;
-  try {
-    authToken = await tokenPool.getToken();
-    debugLog("Token 获取成功: %s...", authToken.substring(0, 10));
-  } catch (error) {
-    debugLog("Token 获取失败: %v", error);
-    const duration = Date.now() - startTime;
-    recordRequestStats(startTime, path, 500);
-    addLiveRequest(request.method, path, 500, duration, userAgent);
-    return new Response("Failed to get authentication token", {
-      status: 500,
-      headers,
-    });
+  const apiKey = authHeader && authHeader.startsWith("Bearer ")
+    ? authHeader.substring(7)
+    : "";
+  if (apiKey && apiKey !== DEFAULT_KEY && apiKey.length > 20) {
+    authToken = apiKey;
+    debugLog(
+      "直连 Token 模式 (Direct Token Mode) 开启: 使用客户端传入的专属 Token (%s...)",
+      authToken.substring(0, 10),
+    );
+  } else {
+    try {
+      const tokenStageStartedAt = perfNow();
+      authToken = await tokenPool.getToken();
+      debugStageDuration("token_pool.getToken", tokenStageStartedAt);
+      debugLog("Token 托管池获取成功: %s...", authToken.substring(0, 10));
+    } catch (error) {
+      debugLog("Token 获取失败: %v", error);
+      const duration = Date.now() - startTime;
+      recordRequestStats(startTime, path, 500);
+      addLiveRequest(request.method, path, 500, duration, userAgent);
+      return new Response("Failed to get authentication token", {
+        status: 500,
+        headers,
+      });
+    }
   }
 
   // 检查是否包含多模态内容并使用新的图像处理器
-  const hasMultimodal = ImageProcessor.hasImageContent(req.messages);
+  const hasMultimodal = ImageProcessor.hasImageContent(inboundMessages);
   let finalMessages = processedMessages;
   let uploadedFiles: UploadedFile[] = [];
 
@@ -6170,22 +10971,25 @@ async function handleChatCompletions(request: Request): Promise<Response> {
       const duration = Date.now() - startTime;
       recordRequestStats(startTime, path, 400);
       addLiveRequest(request.method, path, 400, duration, userAgent);
-      return new Response("匿名Token不支持图像处理功能，请配置ZAI_TOKEN环境变量", {
-        status: 400,
-        headers,
-      });
+      return new Response(
+        "匿名Token不支持图像处理功能，请配置ZAI_TOKEN环境变量",
+        {
+          status: 400,
+          headers,
+        },
+      );
     }
 
     if (!capabilities.vision) {
       debugLog("❌ 严重错误: 模型不支持多模态，但收到了图像内容！");
       debugLog(
-        "💡 Cherry Studio用户请检查: 确认选择了 'glm-4.5v' 而不是 'GLM-4.5'"
+        "💡 Cherry Studio用户请检查: 确认选择了 'glm-4.5v' 而不是 'GLM-4.5'",
       );
       debugLog(
         "🔧 模型映射状态: %s → %s (vision: %s)",
         req.model,
         modelConfig.upstreamId,
-        capabilities.vision
+        capabilities.vision,
       );
     } else {
       debugLog("✅ 使用高级图像处理器处理图像内容");
@@ -6193,17 +10997,19 @@ async function handleChatCompletions(request: Request): Promise<Response> {
       try {
         // 使用新的图像处理器
         const imageProcessResult = await ImageProcessor.processImages(
-          req.messages,
+          inboundMessages,
           authToken,
-          capabilities.vision
+          capabilities.vision,
         );
 
         finalMessages = imageProcessResult.processedMessages;
         uploadedFiles = imageProcessResult.uploadedFiles;
 
-        debugLog("图像处理完成: 处理后消息数=%d, 上传文件数=%d",
-          finalMessages.length, uploadedFiles.length);
-
+        debugLog(
+          "图像处理完成: 处理后消息数=%d, 上传文件数=%d",
+          finalMessages.length,
+          uploadedFiles.length,
+        );
       } catch (error) {
         debugLog("图像处理失败: %v", error);
         const duration = Date.now() - startTime;
@@ -6227,13 +11033,200 @@ async function handleChatCompletions(request: Request): Promise<Response> {
   // 2. 再为当前回复创建 assistant placeholder；
   // 3. /chat/completions 的 id 指向 assistant placeholder，
   //    current_user_message_* 指向它的父 user 节点及 user 的父节点。
-  const existingChatSession = getUpstreamChatSession(authToken);
+  // 优先使用客户端显式会话 ID，避免 compact 请求每句话都被识别成新会话。
+  const explicitConversationId = normalizeClientConversationId(
+    request.headers.get(UPSTREAM_EXPLICIT_CONVERSATION_HEADER) ||
+      req.conversation_id,
+  );
+
+  // Fallback: Generate a deterministic session key based on the first message.
+  const firstMsg = req.messages[0];
+  const firstMsgStr = firstMsg
+    ? `${firstMsg.role}:${
+      typeof firstMsg.content === "string"
+        ? firstMsg.content
+        : JSON.stringify(firstMsg.content)
+    }`
+    : "empty";
+  const firstMsgHash = generateDeterministicUUID(firstMsgStr);
+  const chatSessionScope = explicitConversationId
+    ? `explicit:${modelConfig.id}:${explicitConversationId}`
+    : `first:${modelConfig.id}:${firstMsgHash}`;
+  const legacyChatSessionScope = explicitConversationId
+    ? `explicit:${explicitConversationId}`
+    : `first:${firstMsgHash}`;
+  const chatSessionKey = buildChatSessionKey(authToken, chatSessionScope);
+  const legacyChatSessionKey = buildChatSessionKey(
+    authToken,
+    legacyChatSessionScope,
+  );
+  const clientChatSessionKey = buildClientChatSessionKey(chatSessionScope);
+  const clientLegacyChatSessionKey = buildClientChatSessionKey(
+    legacyChatSessionScope,
+  );
+  const chatSessionLookupKeys = explicitConversationId
+    ? [
+      clientChatSessionKey,
+      clientLegacyChatSessionKey,
+      chatSessionKey,
+      legacyChatSessionKey,
+    ]
+    : [chatSessionKey];
+  const chatSessionAliasKeys = explicitConversationId
+    ? [
+      clientChatSessionKey,
+      clientLegacyChatSessionKey,
+      chatSessionKey,
+      legacyChatSessionKey,
+    ]
+    : [chatSessionKey];
+  debugLog(
+    "上游会话 key: mode=%s scope=%s",
+    explicitConversationId ? "explicit" : "first-message-fingerprint",
+    chatSessionScope,
+  );
+
+  if (!finalMessages.some(hasAssistantPayload)) {
+    const localState = chatSessionLookupKeys
+      .map((key) => getLocalOpenAIConversationState(key))
+      .find((state): state is LocalOpenAIConversationState => !!state) ||
+      (!explicitConversationId && UPSTREAM_COMPACT_REUSE_LOCAL_HISTORY
+        ? findRecentLocalOpenAIConversationByToken(authToken)
+        : null);
+    if (localState?.messages?.length) {
+      const incomingCount = finalMessages.length;
+      finalMessages = mergeLocalHistoryWithIncoming(
+        localState.messages,
+        finalMessages,
+      );
+      debugLog(
+        "compact 请求已用本地 OpenAI 历史补齐: cached_messages=%d incoming_messages=%d final_messages=%d",
+        localState.messages.length,
+        incomingCount,
+        finalMessages.length,
+      );
+    }
+  }
+
+  // Local cached history may have been stored before the OpenAI tool-message
+  // compatibility shim existed; sanitize again right before building Z.ai history.
+  finalMessages = finalMessages.map(sanitizeMessageForZai);
+
+  // 吸收 ds2api 的“统一会话历史管理 (Unified response history session management)”设计优点：
+  // 增加前置用户消息 ID 指纹匹配。如果能够在历史数据库中通过上一个 User 消息 ID 精准定位到会话，
+  // 优先复用该会话！这完美解决多个不同会话具有相同“开场白”（如“hi”）时的上下文串台问题，同时在重启后提供 100% 绝对精准的历史恢复。
+  const hasAssistantHistory = finalMessages.some(hasAssistantPayload);
+  const upstreamParams = buildUpstreamParams(req, modelConfig);
+  const compactUserOnlyContinuation = !hasAssistantHistory &&
+    finalMessages.some((message) => message.role === "user");
+  const canReuseMappedChat = explicitConversationId
+    ? (!hasAssistantHistory || UPSTREAM_REUSE_FULL_HISTORY_CHAT)
+    : (UPSTREAM_REUSE_FIRST_MESSAGE_CHAT && !hasAssistantHistory) ||
+      UPSTREAM_REUSE_FULL_HISTORY_CHAT;
+  let existingChatSession: UpstreamChatSessionState | null = null;
+  let existingChatSessionMatchedExactKey = false;
+  if (canReuseMappedChat) {
+    for (const lookupKey of chatSessionLookupKeys) {
+      existingChatSession = getUpstreamChatSession(lookupKey);
+      if (existingChatSession) {
+        existingChatSessionMatchedExactKey = true;
+        break;
+      }
+    }
+  }
+  if (!canReuseMappedChat) {
+    debugLog(
+      explicitConversationId
+        ? "检测到客户端已携带完整 assistant history；默认新建上游 chat 避免旧分支 parent 串联。若确认需要复用可设置 UPSTREAM_REUSE_FULL_HISTORY_CHAT=true"
+        : "未检测到显式 conversation_id；默认不复用首句指纹映射，避免陈旧 chat_id/parent_id 触发上游 INTERNAL_ERROR。若确认需要复用可设置 UPSTREAM_REUSE_FIRST_MESSAGE_CHAT=true",
+    );
+  }
+
+  // 计算历史中前一个用户消息的确定性 ID
+  let precedingUserMessageID: string | null = null;
+  for (let i = finalMessages.length - 2; i >= 0; i--) {
+    if (finalMessages[i].role === "user") {
+      const message = finalMessages[i];
+      const messageStr = `${i}:${message.role}:${
+        typeof message.content === "string"
+          ? message.content
+          : JSON.stringify(message.content)
+      }`;
+      precedingUserMessageID = generateDeterministicUUID(messageStr);
+      break;
+    }
+  }
+
+  if (canReuseMappedChat && !existingChatSession && precedingUserMessageID) {
+    const tokenPrefix = `${buildTokenSessionPrefix(authToken)}:`;
+    for (const [key, session] of upstreamChatSessions.entries()) {
+      if (!key.startsWith(tokenPrefix)) {
+        continue;
+      }
+      if (session.lastUserMessageId === precedingUserMessageID) {
+        existingChatSession = session;
+        existingChatSessionMatchedExactKey = false;
+        debugLog(
+          "会话继续：通过前置用户消息 ID 指纹成功精准匹配上游会话: chat_id=%s",
+          session.chatId,
+        );
+        break;
+      }
+    }
+  }
+  if (
+    !existingChatSession && compactUserOnlyContinuation &&
+    UPSTREAM_COMPACT_REUSE_RECENT_CHAT
+  ) {
+    existingChatSession = findRecentUpstreamChatSessionByToken(authToken);
+    if (existingChatSession) {
+      existingChatSessionMatchedExactKey = false;
+      debugLog(
+        "会话继续：compact 请求未命中首消息指纹，回退到同 token 最近上游会话: chat_id=%s",
+        existingChatSession.chatId,
+      );
+    }
+  } else if (!existingChatSession && compactUserOnlyContinuation) {
+    debugLog(
+      "compact 请求未命中会话；未启用 UPSTREAM_COMPACT_REUSE_RECENT_CHAT，避免串台，按新会话处理",
+    );
+  }
+
   const historyNodes: Record<string, UpstreamChatHistoryNode> = {};
-  let previousHistoryNodeId: string | null = existingChatSession?.lastAssistantMessageId || null;
+  const compactContinuationParentID =
+    existingChatSession?.lastAssistantMessageId &&
+      existingChatSessionMatchedExactKey && !hasAssistantHistory
+      ? existingChatSession.lastAssistantMessageId
+      : null;
+  let previousHistoryNodeId: string | null = compactContinuationParentID;
   let currentUserMessageID: string | null = null;
   let currentUserMessageParentID: string | null = null;
-  for (const message of finalMessages) {
-    const nodeId = crypto.randomUUID();
+
+  for (let i = 0; i < finalMessages.length; i++) {
+    const message = finalMessages[i];
+    let nodeId: string;
+    if (message.role === "assistant") {
+      const assistantContent = typeof message.content === "string"
+        ? message.content
+        : JSON.stringify(message.content);
+      nodeId = generateDeterministicUUID(
+        compactContinuationParentID
+          ? `${compactContinuationParentID}:${i}:assistant:placeholder`
+          : `${i}:assistant:${assistantContent}`,
+      );
+    } else {
+      const messageStr = `${i}:${message.role}:${
+        typeof message.content === "string"
+          ? message.content
+          : JSON.stringify(message.content)
+      }`;
+      nodeId = generateDeterministicUUID(
+        compactContinuationParentID
+          ? `${compactContinuationParentID}:${messageStr}`
+          : messageStr,
+      );
+    }
+
     historyNodes[nodeId] = {
       id: nodeId,
       parentId: previousHistoryNodeId,
@@ -6252,8 +11245,10 @@ async function handleChatCompletions(request: Request): Promise<Response> {
     }
     previousHistoryNodeId = nodeId;
   }
+
   if (!currentUserMessageID) {
-    currentUserMessageID = crypto.randomUUID();
+    const messageStr = `${finalMessages.length}:user:fallback`;
+    currentUserMessageID = generateDeterministicUUID(messageStr);
     historyNodes[currentUserMessageID] = {
       id: currentUserMessageID,
       parentId: previousHistoryNodeId,
@@ -6264,19 +11259,27 @@ async function handleChatCompletions(request: Request): Promise<Response> {
       models: [modelConfig.upstreamId],
     };
     if (previousHistoryNodeId && historyNodes[previousHistoryNodeId]) {
-      historyNodes[previousHistoryNodeId].childrenIds.push(currentUserMessageID);
+      historyNodes[previousHistoryNodeId].childrenIds.push(
+        currentUserMessageID,
+      );
     }
     currentUserMessageParentID = previousHistoryNodeId;
     previousHistoryNodeId = currentUserMessageID;
   }
 
-  const assistantPlaceholderID = crypto.randomUUID();
+  // 全量历史请求需要稳定 placeholder；只发当前用户消息的客户端则必须按父节点生成新 assistant id。
+  const placeholderStr = currentUserMessageID
+    ? `${currentUserMessageID}:assistant:placeholder`
+    : `${finalMessages.length}:assistant:placeholder`;
+  const assistantPlaceholderID = generateDeterministicUUID(placeholderStr);
   if (currentUserMessageID && historyNodes[currentUserMessageID]) {
     currentUserMessageParentID = historyNodes[currentUserMessageID].parentId;
   }
 
   const bootstrapHistoryMessages: Record<string, UpstreamChatHistoryNode> = {};
-  if (currentUserMessageID && historyNodes[currentUserMessageID]) {
+  if (!existingChatSession && hasAssistantHistory) {
+    Object.assign(bootstrapHistoryMessages, historyNodes);
+  } else if (currentUserMessageID && historyNodes[currentUserMessageID]) {
     bootstrapHistoryMessages[currentUserMessageID] = {
       ...historyNodes[currentUserMessageID],
       childrenIds: [],
@@ -6287,7 +11290,7 @@ async function handleChatCompletions(request: Request): Promise<Response> {
     id: "",
     title: "New Chat",
     models: [modelConfig.upstreamId],
-    params: {},
+    params: upstreamParams,
     history: {
       messages: bootstrapHistoryMessages,
       currentId: currentUserMessageID,
@@ -6302,7 +11305,15 @@ async function handleChatCompletions(request: Request): Promise<Response> {
     timestamp: Date.now(),
     type: "default",
   };
-  const upstreamSession = await upstreamSessionBootstrap.ensureSession(authToken, "");
+  const ensureSessionStartedAt = perfNow();
+  const upstreamSession = await upstreamSessionBootstrap.ensureSession(
+    authToken,
+    "",
+  );
+  debugStageDuration(
+    "upstreamSessionBootstrap.ensureSession",
+    ensureSessionStartedAt,
+  );
   const upstreamAuthToken = upstreamSession.authToken || authToken;
   const browserUserName = getBrowserUserName(upstreamAuthToken, {
     name: upstreamSession.profileName,
@@ -6311,40 +11322,51 @@ async function handleChatCompletions(request: Request): Promise<Response> {
   let chatID: string = existingChatSession?.chatId || crypto.randomUUID();
   if (!existingChatSession) {
     try {
+      const createChatStartedAt = perfNow();
       const bootstrapChat = await upstreamSessionBootstrap.createChat(
         authToken,
         bootstrapPayload,
         "",
       );
+      debugStageDuration(
+        "upstreamSessionBootstrap.createChat",
+        createChatStartedAt,
+      );
       chatID = bootstrapChat.id || bootstrapChat.chat?.id || chatID;
-      updateUpstreamChatSession(authToken, {
+      updateUpstreamChatSessionAliases(chatSessionAliasKeys, {
         chatId: chatID,
         lastUserMessageId: currentUserMessageID,
         lastAssistantMessageId: assistantPlaceholderID,
       });
     } catch (bootstrapError) {
-      debugLog("上游 chats/new bootstrap 失败，回退本地 chat_id: %v", bootstrapError);
-      updateUpstreamChatSession(authToken, {
+      debugLog(
+        "上游 chats/new bootstrap 失败，回退本地 chat_id: %v",
+        bootstrapError,
+      );
+      updateUpstreamChatSessionAliases(chatSessionAliasKeys, {
         chatId: chatID,
         lastUserMessageId: currentUserMessageID,
         lastAssistantMessageId: assistantPlaceholderID,
       });
     }
   } else {
-    updateUpstreamChatSession(authToken, {
+    updateUpstreamChatSessionAliases(chatSessionAliasKeys, {
       chatId: chatID,
       lastUserMessageId: currentUserMessageID,
       lastAssistantMessageId: assistantPlaceholderID,
     });
   }
+
   const now = new Date();
   const currentDateTime = formatBrowserDateTime(now);
 
   // 记录工具信息
   if (req.tools && req.tools.length > 0) {
-    debugLog("🔧 检测到工具定义: 数量=%d, 工具名=[%s]",
+    debugLog(
+      "🔧 检测到工具定义: 数量=%d, 工具名=[%s], forward_to_zai=%s",
       req.tools.length,
-      req.tools.map(t => t.function.name).join(", ")
+      req.tools.map((t) => t.function.name).join(", "),
+      ZAI_FORWARD_OPENAI_TOOLS,
     );
   } else {
     debugLog("🔧 未检测到工具定义");
@@ -6362,6 +11384,23 @@ async function handleChatCompletions(request: Request): Promise<Response> {
     enable_thinking: true,
   };
 
+  const currentUserMessage: Message = {
+    role: "user",
+    content: lastUserContent,
+  };
+  const upstreamMessages = shouldUseZaiToolCallBridge(req)
+    ? finalMessages
+    : capabilities.vision
+    ? finalMessages
+    : [currentUserMessage];
+  if (finalMessages.length !== upstreamMessages.length) {
+    debugLog(
+      "Z.ai completions 请求仅发送当前用户消息，避免重复提交完整 OpenAI 历史触发上游 INTERNAL_ERROR: final_messages=%d upstream_messages=%d",
+      finalMessages.length,
+      upstreamMessages.length,
+    );
+  }
+
   // 构造上游请求，尽量贴近浏览器成功样本
   const upstreamReq: UpstreamRequest = {
     // 与客户端请求保持一致，避免把非流式请求误发成流式。
@@ -6371,8 +11410,8 @@ async function handleChatCompletions(request: Request): Promise<Response> {
     current_user_message_id: currentUserMessageID,
     current_user_message_parent_id: currentUserMessageParentID,
     model: modelConfig.upstreamId,
-    messages: finalMessages,
-    params: {},
+    messages: upstreamMessages,
+    params: upstreamParams,
     extra: {},
     features: requestFeatures,
     background_tasks: {
@@ -6390,19 +11429,31 @@ async function handleChatCompletions(request: Request): Promise<Response> {
       "{{USER_LANGUAGE}}": getPreferredBrowserLanguage(),
     },
     // 添加文件列表（如果有上传的图像）
-    ...(uploadedFiles.length > 0 && !capabilities.vision ? { files: uploadedFiles } : {}),
+    ...(uploadedFiles.length > 0 && !capabilities.vision
+      ? { files: uploadedFiles }
+      : {}),
     // 添加签名提示
     signature_prompt: lastUserContent,
   };
 
-  if (req.tools && req.tools.length > 0) {
+  if (ZAI_FORWARD_OPENAI_TOOLS && req.tools && req.tools.length > 0) {
     upstreamReq.tool_servers = req.tools.map((tool) => tool.function.name);
+  } else if (req.tools && req.tools.length > 0) {
+    debugLog(
+      "🔧 Z.ai 标准 tools 转发已禁用，避免上游 INTERNAL_ERROR；如需实验可设置 ZAI_FORWARD_OPENAI_TOOLS=true",
+    );
   }
 
+  const attachCaptchaStartedAt = perfNow();
   await tryAttachCaptchaVerifyParam(
     upstreamReq,
     upstreamAuthToken,
     modelConfig.id,
+  );
+  debugStageDuration(
+    "tryAttachCaptchaVerifyParam",
+    attachCaptchaStartedAt,
+    `chat_id=${chatID}`,
   );
 
   // 调用上游API
@@ -6412,22 +11463,26 @@ async function handleChatCompletions(request: Request): Promise<Response> {
         upstreamReq,
         chatID,
         upstreamAuthToken,
+        chatSessionAliasKeys,
+        finalMessages,
         startTime,
         path,
         userAgent,
         req,
-        modelConfig
+        modelConfig,
       );
     } else {
       return await handleNonStreamResponse(
         upstreamReq,
         chatID,
         upstreamAuthToken,
+        chatSessionAliasKeys,
+        finalMessages,
         startTime,
         path,
         userAgent,
         req,
-        modelConfig
+        modelConfig,
       );
     }
   } catch (error) {
@@ -6446,55 +11501,20 @@ async function handleStreamResponse(
   upstreamReq: UpstreamRequest,
   chatID: string,
   authToken: string,
+  chatSessionAliasKeys: string[],
+  requestMessages: Message[],
   startTime: number,
   path: string,
   userAgent: string,
   req: OpenAIRequest,
-  modelConfig: ModelConfig
+  modelConfig: ModelConfig,
 ): Promise<Response> {
   debugLog("开始处理流式响应 (chat_id=%s)", chatID);
 
   try {
-    const response = await callUpstreamWithHeaders(
-      upstreamReq,
-      chatID,
-      authToken
-    );
-
-    if (!response.ok) {
-      debugLog("上游返回错误状态: %d", response.status);
-      const upstreamErrorText = await response.text();
-      const upstreamContentType = response.headers.get("content-type") || "text/plain; charset=utf-8";
-      debugLog("上游流式错误响应体预览: %s", upstreamErrorText.slice(0, 2000));
-      const duration = Date.now() - startTime;
-      recordRequestStats(startTime, path, 502);
-      addLiveRequest("POST", path, 502, duration, userAgent);
-      return new Response(upstreamErrorText || "Upstream error", {
-        status: 502,
-        headers: {
-          "Content-Type": upstreamContentType,
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type, Authorization",
-          "Access-Control-Allow-Credentials": "true",
-        },
-      });
-    }
-
-    if (!response.body) {
-      debugLog("上游响应体为空");
-      const duration = Date.now() - startTime;
-      recordRequestStats(startTime, path, 502);
-      addLiveRequest("POST", path, 502, duration, userAgent);
-      return new Response("Upstream response body is empty", { status: 502 });
-    }
-
-    // 创建可读流
     const { readable, writable } = new TransformStream();
     const writer = writable.getWriter();
     const encoder = new TextEncoder();
-
-    // 发送第一个chunk（role）
     const firstChunk: OpenAIResponse = {
       id: `chatcmpl-${Date.now()}`,
       object: "chat.completion.chunk",
@@ -6508,15 +11528,273 @@ async function handleStreamResponse(
       ],
     };
 
-    // 写入第一个chunk
     writer.write(encoder.encode(`data: ${JSON.stringify(firstChunk)}\n\n`));
 
-    // 处理上游SSE流
-    processUpstreamStream(response.body, writer, encoder, req.model).catch(
-      (error) => {
-        debugLog("处理上游流时出错: %v", error);
+    (async () => {
+      try {
+        const upstreamCallStartedAt = perfNow();
+        const response = await callUpstreamWithHeaders(
+          upstreamReq,
+          chatID,
+          authToken,
+        );
+        debugStageDuration(
+          "callUpstreamWithHeaders(stream)",
+          upstreamCallStartedAt,
+          `chat_id=${chatID}`,
+        );
+
+        if (!response.ok) {
+          debugLog("上游返回错误状态: %d", response.status);
+          const upstreamErrorText = await response.text();
+          debugLog(
+            "上游流式错误响应体预览: %s",
+            upstreamErrorText.slice(0, 2000),
+          );
+          await writer.write(
+            encoder.encode(
+              `data: ${
+                JSON.stringify({
+                  error: {
+                    message: upstreamErrorText || "Upstream error",
+                    type: "upstream_error",
+                    code: response.status,
+                  },
+                })
+              }\n\n`,
+            ),
+          );
+          await writer.write(encoder.encode("data: [DONE]\n\n"));
+          await writer.close();
+          return;
+        }
+
+        if (!response.body) {
+          debugLog("上游响应体为空");
+          await writer.write(
+            encoder.encode(
+              `data: ${
+                JSON.stringify({
+                  error: {
+                    message: "Upstream response body is empty",
+                    type: "upstream_empty_body",
+                    code: "UPSTREAM_EMPTY_BODY",
+                  },
+                })
+              }\n\n`,
+            ),
+          );
+          await writer.write(encoder.encode("data: [DONE]\n\n"));
+          await writer.close();
+          return;
+        }
+
+        if (shouldUseZaiToolCallBridge(req)) {
+          const bridgePayload = await processZaiToolBridgeStream(
+            response.body,
+            writer,
+            encoder,
+            req,
+            authToken,
+            startTime,
+          );
+          if (bridgePayload.toolCallMessage?.tool_calls?.length) {
+            await writeToolCallStreamChunks(
+              writer,
+              encoder,
+              req,
+              bridgePayload.toolCallMessage,
+            );
+            await writer.write(encoder.encode("data: [DONE]\n\n"));
+            await writer.close();
+            rememberLocalOpenAIConversationWithAssistant(
+              chatSessionAliasKeys,
+              requestMessages,
+              bridgePayload.toolCallMessage,
+            );
+            return;
+          }
+
+          const endChunk: OpenAIResponse = {
+            id: `chatcmpl-${Date.now()}`,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: req.model,
+            choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          };
+          await writer.write(
+            encoder.encode(`data: ${JSON.stringify(endChunk)}\n\n`),
+          );
+          await writer.write(encoder.encode("data: [DONE]\n\n"));
+          await writer.close();
+          appendAssistantToLocalOpenAIConversation(
+            chatSessionAliasKeys,
+            requestMessages,
+            bridgePayload.content,
+            bridgePayload.reasoningContent,
+          );
+          return;
+        }
+
+        const streamPayload = await processUpstreamStream(
+          response.body,
+          writer,
+          encoder,
+          req.model,
+          authToken,
+          startTime,
+        );
+        appendAssistantToLocalOpenAIConversation(
+          chatSessionAliasKeys,
+          requestMessages,
+          streamPayload.content,
+          streamPayload.reasoningContent,
+        );
+      } catch (error) {
+        let finalError: unknown = error;
+        const message = String(error && (error as Error).message || error);
+        if (message.startsWith("UPSTREAM_SSE_ERROR:")) {
+          const detail = message.slice("UPSTREAM_SSE_ERROR:".length);
+          try {
+            const errObj = JSON.parse(detail) as UpstreamError;
+            if (isUpstreamCaptchaError(errObj)) {
+              const retryAttempted =
+                upstreamReq.extra?.__captcha_retry_attempted === true;
+              if (!retryAttempted) {
+                debugLog(
+                  "流式响应命中 CAPTCHA 错误，强制获取 captcha_verify_param 后重试一次: code=%s verify_code=%s captcha_error_type=%s",
+                  String(errObj.error_code || errObj.code || ""),
+                  String(errObj.verify_code || ""),
+                  String(errObj.captcha_error_type || ""),
+                );
+                const retryBuild = await rebuildUpstreamRequestForCaptchaRetry(
+                  upstreamReq,
+                  authToken,
+                  requestMessages,
+                );
+                await tryAttachCaptchaVerifyParam(
+                  retryBuild.upstreamReq,
+                  authToken,
+                  modelConfig.id,
+                  true,
+                );
+                if (retryBuild.upstreamReq.captcha_verify_param) {
+                  updateUpstreamChatSessionAliases(chatSessionAliasKeys, {
+                    chatId: retryBuild.chatID,
+                    lastUserMessageId:
+                      retryBuild.upstreamReq.current_user_message_id || null,
+                    lastAssistantMessageId: retryBuild.upstreamReq.id || null,
+                  });
+                  try {
+                    const retryStartedAt = perfNow();
+                    const retryResponse = await callUpstreamWithHeaders(
+                      retryBuild.upstreamReq,
+                      retryBuild.chatID,
+                      authToken,
+                    );
+                    debugStageDuration(
+                      "callUpstreamWithHeaders(stream.captcha_retry)",
+                      retryStartedAt,
+                      `chat_id=${retryBuild.chatID}`,
+                    );
+                    if (retryResponse.ok && retryResponse.body) {
+                      if (shouldUseZaiToolCallBridge(req)) {
+                        const retryPayload = await processZaiToolBridgeStream(
+                          retryResponse.body,
+                          writer,
+                          encoder,
+                          req,
+                          authToken,
+                          startTime,
+                        );
+                        if (retryPayload.toolCallMessage?.tool_calls?.length) {
+                          await writeToolCallStreamChunks(
+                            writer,
+                            encoder,
+                            req,
+                            retryPayload.toolCallMessage,
+                          );
+                          await writer.write(
+                            encoder.encode("data: [DONE]\n\n"),
+                          );
+                          await writer.close();
+                          rememberLocalOpenAIConversationWithAssistant(
+                            chatSessionAliasKeys,
+                            requestMessages,
+                            retryPayload.toolCallMessage,
+                          );
+                          return;
+                        }
+                        appendAssistantToLocalOpenAIConversation(
+                          chatSessionAliasKeys,
+                          requestMessages,
+                          retryPayload.content,
+                          retryPayload.reasoningContent,
+                        );
+                      } else {
+                        const retryPayload = await processUpstreamStream(
+                          retryResponse.body,
+                          writer,
+                          encoder,
+                          req.model,
+                          authToken,
+                          startTime,
+                        );
+                        appendAssistantToLocalOpenAIConversation(
+                          chatSessionAliasKeys,
+                          requestMessages,
+                          retryPayload.content,
+                          retryPayload.reasoningContent,
+                        );
+                      }
+                      return;
+                    }
+                    const retryErrorText = retryResponse.ok
+                      ? "Upstream response body is empty after CAPTCHA retry"
+                      : await retryResponse.text();
+                    finalError = new Error(
+                      retryErrorText ||
+                        `Upstream CAPTCHA retry failed: ${retryResponse.status}`,
+                    );
+                  } catch (retryError) {
+                    finalError = retryError;
+                  }
+                } else {
+                  debugLog(
+                    "CAPTCHA 错误后流式重试前仍未拿到 captcha_verify_param",
+                  );
+                }
+              }
+            }
+          } catch (parseError) {
+            debugLog("解析流式 CAPTCHA 错误详情失败: %v", parseError);
+          }
+        }
+
+        debugLog("处理上游流时出错: %v", finalError);
+        try {
+          await writer.write(
+            encoder.encode(
+              `data: ${
+                JSON.stringify({
+                  error: {
+                    message: String(
+                      finalError && (finalError as Error).message || finalError,
+                    ),
+                    type: "stream_pipeline_error",
+                    code: "STREAM_PIPELINE_ERROR",
+                  },
+                })
+              }\n\n`,
+            ),
+          );
+          await writer.write(encoder.encode("data: [DONE]\n\n"));
+          await writer.close();
+        } catch {
+          // Client may have disconnected.
+        }
       }
-    );
+    })();
 
     // 记录成功请求统计
     const duration = Date.now() - startTime;
@@ -6548,19 +11826,27 @@ async function handleNonStreamResponse(
   upstreamReq: UpstreamRequest,
   chatID: string,
   authToken: string,
+  chatSessionAliasKeys: string[],
+  requestMessages: Message[],
   startTime: number,
   path: string,
   userAgent: string,
   req: OpenAIRequest,
-  modelConfig: ModelConfig
+  modelConfig: ModelConfig,
 ): Promise<Response> {
   debugLog("开始处理非流式响应 (chat_id=%s)", chatID);
 
   try {
+    const upstreamCallStartedAt = perfNow();
     const response = await callUpstreamWithHeaders(
       upstreamReq,
       chatID,
-      authToken
+      authToken,
+    );
+    debugStageDuration(
+      "callUpstreamWithHeaders(nonstream)",
+      upstreamCallStartedAt,
+      `chat_id=${chatID}`,
     );
 
     if (!response.ok) {
@@ -6590,13 +11876,31 @@ async function handleNonStreamResponse(
       return new Response("Upstream response body is empty", { status: 502 });
     }
 
-    // 收集完整响应
-    const rawUpstreamText = await response.text();
-    const finalContent = collectFullResponseFromText(rawUpstreamText);
-    debugLog("上游非流式原始响应预览: %s", rawUpstreamText.slice(0, 2000));
-    debugLog("内容收集完成，最终长度: %d", finalContent.length);
+    // 按 SSE 增量收集，读到 done 即返回，避免 response.text() 挂住
+    const responsePayload = await collectFullResponse(response.body);
+    debugLog(
+      "内容收集完成: answer_len=%d reasoning_len=%d mode=%s",
+      responsePayload.content.length,
+      responsePayload.reasoningContent.length,
+      getThinkingOutputMode(),
+    );
+
+    const bridgeToolCallMessage = shouldUseZaiToolCallBridge(req)
+      ? buildZaiBridgeToolCallResponseMessage(responsePayload.content, req)
+      : null;
 
     // 构造完整响应
+    const responseMessage: Message = bridgeToolCallMessage || {
+      role: "assistant",
+      content: responsePayload.content,
+    };
+    if (
+      !bridgeToolCallMessage &&
+      getThinkingOutputMode() === "separate" &&
+      responsePayload.reasoningContent
+    ) {
+      responseMessage.reasoning_content = responsePayload.reasoningContent;
+    }
     const openAIResponse: OpenAIResponse = {
       id: `chatcmpl-${Date.now()}`,
       object: "chat.completion",
@@ -6605,11 +11909,8 @@ async function handleNonStreamResponse(
       choices: [
         {
           index: 0,
-          message: {
-            role: "assistant",
-            content: finalContent,
-          },
-          finish_reason: "stop",
+          message: responseMessage,
+          finish_reason: bridgeToolCallMessage ? "tool_calls" : "stop",
         },
       ],
       usage: {
@@ -6623,6 +11924,20 @@ async function handleNonStreamResponse(
     const duration = Date.now() - startTime;
     recordRequestStats(startTime, path, 200);
     addLiveRequest("POST", path, 200, duration, userAgent, modelConfig.name);
+    if (bridgeToolCallMessage) {
+      rememberLocalOpenAIConversationWithAssistant(
+        chatSessionAliasKeys,
+        requestMessages,
+        responseMessage,
+      );
+    } else {
+      appendAssistantToLocalOpenAIConversation(
+        chatSessionAliasKeys,
+        requestMessages,
+        responsePayload.content,
+        responsePayload.reasoningContent,
+      );
+    }
 
     return new Response(JSON.stringify(openAIResponse), {
       status: 200,
@@ -6641,7 +11956,8 @@ async function handleNonStreamResponse(
       try {
         const errObj = JSON.parse(detail) as UpstreamError;
         if (isUpstreamCaptchaError(errObj)) {
-          const retryAttempted = upstreamReq.extra?.__captcha_retry_attempted === true;
+          const retryAttempted =
+            upstreamReq.extra?.__captcha_retry_attempted === true;
           if (!retryAttempted) {
             debugLog(
               "非流式响应命中 CAPTCHA 错误，尝试获取 captcha_verify_param 后重试一次: code=%s verify_code=%s captcha_error_type=%s",
@@ -6649,21 +11965,33 @@ async function handleNonStreamResponse(
               String(errObj.verify_code || ""),
               String(errObj.captcha_error_type || ""),
             );
-            if (!upstreamReq.extra) {
-              upstreamReq.extra = {};
-            }
-            upstreamReq.extra.__captcha_retry_attempted = true;
-            await tryAttachCaptchaVerifyParam(
+            const retryBuild = await rebuildUpstreamRequestForCaptchaRetry(
               upstreamReq,
               authToken,
-              modelConfig.id,
+              requestMessages,
             );
-            if (upstreamReq.captcha_verify_param) {
-              debugLog("已在 CAPTCHA 错误后补注入 captcha_verify_param，开始重试非流式请求");
+            await tryAttachCaptchaVerifyParam(
+              retryBuild.upstreamReq,
+              authToken,
+              modelConfig.id,
+              true,
+            );
+            if (retryBuild.upstreamReq.captcha_verify_param) {
+              debugLog(
+                "已在 CAPTCHA 错误后补注入 captcha_verify_param，开始重试非流式请求",
+              );
+              updateUpstreamChatSessionAliases(chatSessionAliasKeys, {
+                chatId: retryBuild.chatID,
+                lastUserMessageId:
+                  retryBuild.upstreamReq.current_user_message_id || null,
+                lastAssistantMessageId: retryBuild.upstreamReq.id || null,
+              });
               return await handleNonStreamResponse(
-                upstreamReq,
-                chatID,
+                retryBuild.upstreamReq,
+                retryBuild.chatID,
                 authToken,
+                chatSessionAliasKeys,
+                requestMessages,
                 startTime,
                 path,
                 userAgent,
@@ -6674,8 +12002,10 @@ async function handleNonStreamResponse(
             debugLog("CAPTCHA 错误后重试前仍未拿到 captcha_verify_param");
           }
           invalidateCaptchaVerifyParam(
+            authToken,
             `upstream-nonstream-error:${
-              errObj.verify_code || errObj.captcha_error_type || errObj.error_code || errObj.code || "unknown"
+              errObj.verify_code || errObj.captcha_error_type ||
+              errObj.error_code || errObj.code || "unknown"
             }`,
           );
         }
@@ -8571,13 +13901,693 @@ async function handleDenoDeploy(request: Request): Promise<Response> {
   });
 }
 
+function trimRoutePrefix(pathname: string, prefix: string): string | null {
+  return pathname.startsWith(prefix) && pathname.length > prefix.length
+    ? pathname.slice(prefix.length)
+    : null;
+}
+
+function isGeminiCompatibilityPath(pathname: string): boolean {
+  return /^\/v1(?:beta)?\/models\/[^/]+:(?:generateContent|streamGenerateContent)$/
+    .test(pathname);
+}
+
+function unsupportedOpenAICompatResponse(
+  request: Request,
+  feature: string,
+): Response {
+  const headers = new Headers();
+  setCORSHeaders(headers);
+  headers.set("Content-Type", "application/json");
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 200, headers });
+  }
+  return new Response(
+    buildOpenAIError(
+      `${feature} compatibility endpoint is registered but not implemented by this provider yet`,
+      "unsupported_feature",
+      "unsupported_feature",
+    ),
+    { status: 501, headers },
+  );
+}
+
+function normalizeEmbeddingInput(input: unknown): string[] {
+  if (typeof input === "string") return [input];
+  if (Array.isArray(input)) {
+    return input.map((item) => {
+      if (typeof item === "string") return item;
+      if (Array.isArray(item)) return item.join(" ");
+      return JSON.stringify(item ?? "");
+    });
+  }
+  return [JSON.stringify(input ?? "")];
+}
+
+async function deterministicEmbeddingVector(
+  text: string,
+  dimensions: number,
+): Promise<number[]> {
+  const seedBytes = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(text),
+  );
+  const seed = new Uint8Array(seedBytes);
+  const vector = new Array<number>(dimensions).fill(0);
+  for (let i = 0; i < dimensions; i++) {
+    const byte = seed[i % seed.length];
+    const trig = Math.sin((byte + 1) * (i + 1) * 0.017453292519943295);
+    vector[i] = Number((trig * 0.5).toFixed(6));
+  }
+  const norm =
+    Math.sqrt(vector.reduce((sum, value) => sum + value * value, 0)) || 1;
+  return vector.map((value) => Number((value / norm).toFixed(6)));
+}
+
+async function handleEmbeddingsCompatibility(
+  request: Request,
+): Promise<Response> {
+  const headers = new Headers();
+  setCORSHeaders(headers);
+  headers.set("Content-Type", "application/json");
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 200, headers });
+  }
+  if (request.method !== "POST") {
+    return new Response("Method not allowed", { status: 405, headers });
+  }
+  const authHeader = request.headers.get("Authorization");
+  if (!validateApiKey(authHeader)) {
+    return new Response("Missing or invalid Authorization header", {
+      status: 401,
+      headers,
+    });
+  }
+  let body: Record<string, any>;
+  try {
+    body = await request.json() as Record<string, any>;
+  } catch {
+    return new Response(
+      buildOpenAIError("Invalid JSON", "invalid_request_error", "invalid_json"),
+      { status: 400, headers },
+    );
+  }
+
+  const input = normalizeEmbeddingInput(body.input);
+  const dimensions = Math.max(
+    1,
+    Math.min(3072, Math.floor(Number(body.dimensions || 1536))),
+  );
+  const data = [];
+  for (let index = 0; index < input.length; index++) {
+    data.push({
+      object: "embedding",
+      index,
+      embedding: await deterministicEmbeddingVector(input[index], dimensions),
+    });
+  }
+  const promptTokens = input.reduce(
+    (sum, value) => sum + Math.max(1, Math.ceil(value.length / 4)),
+    0,
+  );
+  return new Response(
+    JSON.stringify({
+      object: "list",
+      data,
+      model: String(body.model || "ztoapi-deterministic-embedding"),
+      usage: { prompt_tokens: promptTokens, total_tokens: promptTokens },
+    }),
+    { status: 200, headers },
+  );
+}
+
+function geminiPathInfo(
+  pathname: string,
+): { model: string; stream: boolean } | null {
+  const match = pathname.match(
+    /^\/v1(?:beta)?\/models\/([^/]+):(generateContent|streamGenerateContent)$/,
+  );
+  return match
+    ? {
+      model: decodeURIComponent(match[1]),
+      stream: match[2] === "streamGenerateContent",
+    }
+    : null;
+}
+
+function geminiPartToText(part: Record<string, any>): string {
+  if (typeof part.text === "string") return part.text;
+  if (part.functionCall) {
+    return `Function call ${part.functionCall.name}: ${
+      JSON.stringify(part.functionCall.args || {})
+    }`;
+  }
+  if (part.functionResponse) {
+    return `Function response ${part.functionResponse.name}: ${
+      JSON.stringify(part.functionResponse.response || {})
+    }`;
+  }
+  if (part.inlineData) {
+    return `[inline data: ${
+      part.inlineData.mimeType || "application/octet-stream"
+    }]`;
+  }
+  if (part.fileData) {
+    return `[file: ${
+      part.fileData.fileUri || part.fileData.mimeType || "unknown"
+    }]`;
+  }
+  return "";
+}
+
+function geminiPartsToOpenAIContent(
+  parts: Array<Record<string, any>>,
+): Message["content"] {
+  const out: Array<{
+    type: string;
+    text?: string;
+    image_url?: { url: string };
+    document_url?: { url: string };
+    audio_url?: { url: string };
+    video_url?: { url: string };
+  }> = [];
+  for (const part of parts) {
+    if (typeof part.text === "string") {
+      out.push({ type: "text", text: part.text });
+      continue;
+    }
+    const inlineData = part.inlineData || part.inline_data;
+    if (inlineData?.data) {
+      const mimeType = String(
+        inlineData.mimeType || inlineData.mime_type ||
+          "application/octet-stream",
+      );
+      const url = `data:${mimeType};base64,${inlineData.data}`;
+      if (mimeType.startsWith("image/")) {
+        out.push({ type: "image_url", image_url: { url } });
+      } else if (mimeType.startsWith("audio/")) {
+        out.push({ type: "audio_url", audio_url: { url } });
+      } else if (mimeType.startsWith("video/")) {
+        out.push({ type: "video_url", video_url: { url } });
+      } else out.push({ type: "document_url", document_url: { url } });
+      continue;
+    }
+    const fileData = part.fileData || part.file_data;
+    if (fileData?.fileUri || fileData?.file_uri) {
+      const url = String(fileData.fileUri || fileData.file_uri);
+      const mimeType = String(
+        fileData.mimeType || fileData.mime_type || "application/octet-stream",
+      );
+      if (mimeType.startsWith("image/")) {
+        out.push({ type: "image_url", image_url: { url } });
+      } else if (mimeType.startsWith("audio/")) {
+        out.push({ type: "audio_url", audio_url: { url } });
+      } else if (mimeType.startsWith("video/")) {
+        out.push({ type: "video_url", video_url: { url } });
+      } else out.push({ type: "document_url", document_url: { url } });
+      continue;
+    }
+    const text = geminiPartToText(part);
+    if (text) out.push({ type: "text", text });
+  }
+  if (out.length === 0) return "";
+  if (out.every((part) => part.type === "text")) {
+    return out.map((part) => part.text || "").filter(Boolean).join("\n");
+  }
+  return out;
+}
+
+function geminiToolConfigToOpenAIToolChoice(
+  toolConfig: Record<string, any> | undefined,
+): ToolChoice | undefined {
+  const config = toolConfig?.functionCallingConfig ||
+    toolConfig?.function_calling_config;
+  if (!config) return undefined;
+  const mode = String(config.mode || "").toUpperCase();
+  if (mode === "NONE") return "none";
+  if (mode === "AUTO") return "auto";
+  const allowed = config.allowedFunctionNames || config.allowed_function_names;
+  if (mode === "ANY" && Array.isArray(allowed) && allowed.length === 1) {
+    return { type: "function", function: { name: String(allowed[0]) } };
+  }
+  if (mode === "ANY") return "required";
+  return undefined;
+}
+
+function geminiRequestToOpenAIRequest(
+  body: Record<string, any>,
+  model: string,
+  stream: boolean,
+): OpenAIRequest {
+  const messages: Message[] = [];
+  const systemParts = body.systemInstruction?.parts;
+  if (Array.isArray(systemParts)) {
+    const systemText = systemParts.map(geminiPartToText).filter(Boolean).join(
+      "\n",
+    );
+    if (systemText) messages.push({ role: "system", content: systemText });
+  }
+  for (const content of Array.isArray(body.contents) ? body.contents : []) {
+    const role = content.role === "model" ? "assistant" : "user";
+    const parts = Array.isArray(content.parts) ? content.parts : [];
+    messages.push({ role, content: geminiPartsToOpenAIContent(parts) });
+  }
+  const functionDeclarations = (Array.isArray(body.tools) ? body.tools : [])
+    .flatMap((tool: Record<string, any>) =>
+      Array.isArray(tool.functionDeclarations) ? tool.functionDeclarations : []
+    );
+  const tools = functionDeclarations.map((decl: Record<string, any>) => ({
+    type: "function" as const,
+    function: {
+      name: String(decl.name || ""),
+      description: decl.description || "",
+      parameters: decl.parameters || {},
+    },
+  })).filter((tool: Tool) => tool.function.name);
+  const generationConfig = body.generationConfig || {};
+  const request: OpenAIRequest = {
+    model,
+    messages: messages.length ? messages : [{ role: "user", content: "" }],
+    stream,
+    temperature: typeof generationConfig.temperature === "number"
+      ? generationConfig.temperature
+      : undefined,
+    top_p: typeof generationConfig.topP === "number"
+      ? generationConfig.topP
+      : undefined,
+    max_tokens: typeof generationConfig.maxOutputTokens === "number"
+      ? generationConfig.maxOutputTokens
+      : undefined,
+    tools: tools.length ? tools : undefined,
+    tool_choice: geminiToolConfigToOpenAIToolChoice(body.toolConfig),
+  };
+  (request as any).safetySettings = body.safetySettings || body.safety_settings;
+  (request as any).cachedContent = body.cachedContent || body.cached_content;
+  return request;
+}
+
+function openAIChatToGeminiPayload(
+  chat: OpenAIResponse,
+): Record<string, unknown> {
+  const choice = chat.choices?.[0] || {};
+  const message = choice.message || { role: "assistant", content: "" };
+  const parts: Array<Record<string, unknown>> = [];
+  const text = messageContentToText(message.content);
+  if (text) parts.push({ text });
+  for (const toolCall of message.tool_calls || []) {
+    parts.push({
+      functionCall: {
+        name: toolCall.function.name,
+        args: parseToolArguments(toolCall.function.arguments),
+      },
+    });
+  }
+  return {
+    candidates: [{
+      content: { role: "model", parts },
+      finishReason: message.tool_calls?.length ? "STOP" : "STOP",
+      index: 0,
+    }],
+    usageMetadata: chat.usage
+      ? {
+        promptTokenCount: chat.usage.prompt_tokens,
+        candidatesTokenCount: chat.usage.completion_tokens,
+        totalTokenCount: chat.usage.total_tokens,
+      }
+      : undefined,
+  };
+}
+
+function openAIStreamToGeminiStream(chatResponse: Response): Response {
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const headers = new Headers({
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+  });
+  setCORSHeaders(headers);
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const reader = chatResponse.body?.getReader();
+      if (!reader) {
+        controller.close();
+        return;
+      }
+      let buffer = "";
+      const send = (payload: unknown) => {
+        controller.enqueue(
+          encoder.encode(`data: ${JSON.stringify(payload)}\n\n`),
+        );
+      };
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const events = buffer.split("\n\n");
+          buffer = events.pop() || "";
+          for (const event of events) {
+            for (const line of event.split("\n")) {
+              if (!line.startsWith("data:")) continue;
+              const dataStr = line.slice(5).trim();
+              if (!dataStr || dataStr === "[DONE]") continue;
+              const chunk = JSON.parse(dataStr) as OpenAIResponse;
+              const delta = chunk.choices?.[0]?.delta || {};
+              if (delta.content) {
+                send({
+                  candidates: [{
+                    content: {
+                      role: "model",
+                      parts: [{ text: delta.content }],
+                    },
+                    index: 0,
+                  }],
+                });
+              }
+              for (const toolDelta of delta.tool_calls || []) {
+                if (toolDelta.function?.name || toolDelta.function?.arguments) {
+                  send({
+                    candidates: [{
+                      content: {
+                        role: "model",
+                        parts: [{
+                          functionCall: {
+                            name: toolDelta.function?.name || "",
+                            args: parseToolArguments(
+                              toolDelta.function?.arguments || "{}",
+                            ),
+                          },
+                        }],
+                      },
+                      index: 0,
+                    }],
+                  });
+                }
+              }
+            }
+          }
+        }
+        send({
+          candidates: [{
+            content: { role: "model", parts: [] },
+            finishReason: "STOP",
+            index: 0,
+          }],
+        });
+      } catch (error) {
+        send({
+          error: {
+            code: 500,
+            message: String(error && (error as Error).message || error),
+            status: "INTERNAL",
+          },
+        });
+      } finally {
+        reader.releaseLock();
+        controller.close();
+      }
+    },
+  });
+  return new Response(stream, { status: 200, headers });
+}
+
+async function handleGeminiCompatibility(
+  request: Request,
+  pathname: string,
+): Promise<Response> {
+  const headers = new Headers();
+  setCORSHeaders(headers);
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 200, headers });
+  }
+  if (request.method !== "POST") {
+    return new Response("Method not allowed", { status: 405, headers });
+  }
+  const info = geminiPathInfo(pathname);
+  if (!info) return new Response("Not found", { status: 404, headers });
+  let body: Record<string, any>;
+  try {
+    body = await request.json() as Record<string, any>;
+  } catch {
+    return new Response(
+      JSON.stringify({
+        error: {
+          code: 400,
+          message: "Invalid JSON",
+          status: "INVALID_ARGUMENT",
+        },
+      }),
+      { status: 400, headers },
+    );
+  }
+  const chatReq = geminiRequestToOpenAIRequest(body, info.model, info.stream);
+  const chatUrl = new URL(request.url);
+  chatUrl.pathname = "/v1/chat/completions";
+  const chatResponse = await handleChatCompletions(
+    new Request(chatUrl, {
+      method: "POST",
+      headers: request.headers,
+      body: JSON.stringify(chatReq),
+    }),
+  );
+  if (info.stream) return openAIStreamToGeminiStream(chatResponse);
+  const chatText = await chatResponse.text();
+  if (!chatResponse.ok) {
+    return new Response(chatText, { status: chatResponse.status, headers });
+  }
+  try {
+    headers.set("Content-Type", "application/json");
+    return new Response(
+      JSON.stringify(
+        openAIChatToGeminiPayload(JSON.parse(chatText) as OpenAIResponse),
+      ),
+      { status: 200, headers },
+    );
+  } catch {
+    return new Response(chatText, { status: 502, headers });
+  }
+}
+
+async function handleFilesCompatibility(request: Request): Promise<Response> {
+  const headers = new Headers();
+  setCORSHeaders(headers);
+  headers.set("Content-Type", "application/json");
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 200, headers });
+  }
+  await ensureFileStorageLoaded();
+  cleanupStoredFiles();
+  const owner = getResponseStoreOwner(request);
+  if (request.method === "GET") {
+    const data = Array.from(fileObjectStore.values())
+      .filter((file) => file.owner === owner)
+      .map(publicFilePayload);
+    return new Response(JSON.stringify({ object: "list", data }), {
+      status: 200,
+      headers,
+    });
+  }
+  if (request.method !== "POST") {
+    return new Response("Method not allowed", { status: 405, headers });
+  }
+  const form = await request.formData().catch(() => null);
+  if (!form) {
+    return new Response(
+      buildOpenAIError(
+        "Files endpoint expects multipart/form-data",
+        "invalid_request_error",
+        "invalid_request",
+      ),
+      { status: 400, headers },
+    );
+  }
+  const file = form.get("file");
+  const purpose = String(form.get("purpose") || "assistants");
+  if (!(file instanceof File)) {
+    return new Response(
+      buildOpenAIError(
+        "Missing multipart file field named 'file'",
+        "invalid_request_error",
+        "missing_file",
+      ),
+      { status: 400, headers },
+    );
+  }
+  const contentBytes = new Uint8Array(await file.arrayBuffer());
+  const id = `file_${crypto.randomUUID().replace(/-/g, "")}`;
+  const stored = {
+    owner,
+    id,
+    object: "file" as const,
+    bytes: file.size,
+    created_at: Math.floor(Date.now() / 1000),
+    filename: file.name || "upload",
+    purpose,
+    contentBytes,
+    contentPath: fileContentPath(id),
+    contentType: file.type || "application/octet-stream",
+  };
+  fileObjectStore.set(id, stored);
+  await savePersistentFile(stored);
+  return new Response(JSON.stringify(publicFilePayload(stored)), {
+    status: 200,
+    headers,
+  });
+}
+
+async function handleFileByIdCompatibility(
+  request: Request,
+  fileId: string,
+): Promise<Response> {
+  const headers = new Headers();
+  setCORSHeaders(headers);
+  headers.set("Content-Type", "application/json");
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 200, headers });
+  }
+  await ensureFileStorageLoaded();
+  cleanupStoredFiles();
+  const normalizedFileId = decodeURIComponent(fileId).replace(/\/content$/, "");
+  const stored = fileObjectStore.get(normalizedFileId);
+  if (
+    request.method === "DELETE" &&
+    stored?.owner === getResponseStoreOwner(request)
+  ) {
+    fileObjectStore.delete(normalizedFileId);
+    await deletePersistentFile(normalizedFileId);
+    return new Response(
+      JSON.stringify({ id: normalizedFileId, object: "file", deleted: true }),
+      {
+        status: 200,
+        headers,
+      },
+    );
+  }
+  if (stored && stored.owner === getResponseStoreOwner(request)) {
+    if (decodeURIComponent(fileId).endsWith("/content")) {
+      headers.set(
+        "Content-Type",
+        stored.contentType || "application/octet-stream",
+      );
+      const bytes = await readStoredFileBytes(stored);
+      const body = new Uint8Array(bytes.length);
+      body.set(bytes);
+      return new Response(body, {
+        status: 200,
+        headers,
+      });
+    }
+    return new Response(JSON.stringify(publicFilePayload(stored)), {
+      status: 200,
+      headers,
+    });
+  }
+  return new Response(
+    buildOpenAIError(
+      `File not found: ${fileId}`,
+      "invalid_request_error",
+      "not_found",
+    ),
+    { status: 404, headers },
+  );
+}
+
+function isAIProviderCompatibilityPath(pathname: string): boolean {
+  return pathname === "/v1/models" ||
+    pathname === "/models" ||
+    pathname.startsWith("/v1/models/") ||
+    pathname.startsWith("/models/") ||
+    pathname === "/v1/chat/completions" ||
+    pathname === "/chat/completions" ||
+    pathname === "/v1/responses" ||
+    pathname === "/responses" ||
+    pathname.startsWith("/v1/responses/") ||
+    pathname.startsWith("/responses/") ||
+    pathname === "/anthropic/v1/models" ||
+    pathname === "/anthropic/v1/messages" ||
+    pathname === "/v1/messages" ||
+    pathname === "/messages" ||
+    pathname === "/anthropic/v1/messages/count_tokens" ||
+    pathname === "/v1/messages/count_tokens" ||
+    pathname === "/messages/count_tokens" ||
+    pathname === "/v1/embeddings" ||
+    pathname === "/embeddings" ||
+    pathname === "/v1/files" ||
+    pathname === "/files" ||
+    pathname.startsWith("/v1/files/") ||
+    pathname.startsWith("/files/") ||
+    isGeminiCompatibilityPath(pathname);
+}
+
+async function handleAIProviderCompatibilityRoute(
+  request: Request,
+  pathname: string,
+): Promise<Response> {
+  if (pathname === "/v1/models" || pathname === "/models") {
+    return await handleModels(request);
+  }
+  const modelId = trimRoutePrefix(pathname, "/v1/models/") ||
+    trimRoutePrefix(pathname, "/models/");
+  if (modelId !== null) {
+    return await handleModelById(request, modelId);
+  }
+  if (pathname === "/v1/chat/completions" || pathname === "/chat/completions") {
+    return await handleChatCompletions(request);
+  }
+  if (pathname === "/v1/responses" || pathname === "/responses") {
+    return await handleResponses(request);
+  }
+  const responseId = trimRoutePrefix(pathname, "/v1/responses/") ||
+    trimRoutePrefix(pathname, "/responses/");
+  if (responseId !== null) {
+    return await handleGetResponse(request, responseId);
+  }
+  if (pathname === "/anthropic/v1/models") {
+    return await handleAnthropicModels(request);
+  }
+  if (pathname === "/v1/embeddings" || pathname === "/embeddings") {
+    return await handleEmbeddingsCompatibility(request);
+  }
+  if (pathname === "/v1/files" || pathname === "/files") {
+    return await handleFilesCompatibility(request);
+  }
+  const fileId = trimRoutePrefix(pathname, "/v1/files/") ||
+    trimRoutePrefix(pathname, "/files/");
+  if (fileId !== null) {
+    return await handleFileByIdCompatibility(request, fileId);
+  }
+  if (isGeminiCompatibilityPath(pathname)) {
+    return await handleGeminiCompatibility(request, pathname);
+  }
+  if (
+    pathname === "/anthropic/v1/messages/count_tokens" ||
+    pathname === "/v1/messages/count_tokens" ||
+    pathname === "/messages/count_tokens"
+  ) {
+    return await handleAnthropicTokenCount(request);
+  }
+  if (
+    pathname === "/anthropic/v1/messages" ||
+    pathname === "/v1/messages" ||
+    pathname === "/messages"
+  ) {
+    return await handleAnthropicMessages(request);
+  }
+  return await handleOptions(request);
+}
+
 // 主HTTP服务器
 async function main() {
+  loadUpstreamChatSessions();
+  warmCaptchaWorkerInBackground("startup");
   console.log(`OpenAI兼容API服务器启动`);
   console.log(
-    `支持的模型: ${SUPPORTED_MODELS.map((m) => `${m.id} (${m.name})`).join(
-      ", "
-    )}`
+    `支持的模型: ${
+      SUPPORTED_MODELS.map((m) => `${m.id} (${m.name})`).join(
+        ", ",
+      )
+    }`,
   );
   console.log(`上游: ${UPSTREAM_URL}`);
   console.log(`Debug模式: ${DEBUG_MODE}`);
@@ -8598,7 +14608,7 @@ async function main() {
 
     if (DASHBOARD_ENABLED) {
       console.log(
-        `Dashboard已启用，访问地址: http://localhost:${port}/dashboard`
+        `Dashboard已启用，访问地址: http://localhost:${port}/dashboard`,
       );
     }
 
@@ -8634,8 +14644,32 @@ async function handleHttp(conn: Deno.Conn) {
           url.pathname,
           response.status,
           Date.now() - startTime,
-          userAgent
+          userAgent,
         );
+      } else if (isAIProviderCompatibilityPath(url.pathname)) {
+        const response = await handleAIProviderCompatibilityRoute(
+          request,
+          url.pathname,
+        );
+        await respondWith(response);
+        if (
+          url.pathname !== "/v1/chat/completions" &&
+          url.pathname !== "/chat/completions" &&
+          url.pathname !== "/v1/responses" &&
+          url.pathname !== "/responses" &&
+          url.pathname !== "/anthropic/v1/messages" &&
+          url.pathname !== "/v1/messages" &&
+          url.pathname !== "/messages"
+        ) {
+          recordRequestStats(startTime, url.pathname, response.status);
+          addLiveRequest(
+            request.method,
+            url.pathname,
+            response.status,
+            Date.now() - startTime,
+            userAgent,
+          );
+        }
       } else if (url.pathname === "/v1/models") {
         const response = await handleModels(request);
         await respondWith(response);
@@ -8645,10 +14679,14 @@ async function handleHttp(conn: Deno.Conn) {
           url.pathname,
           response.status,
           Date.now() - startTime,
-          userAgent
+          userAgent,
         );
       } else if (url.pathname === "/v1/chat/completions") {
         const response = await handleChatCompletions(request);
+        await respondWith(response);
+        // 请求统计已在handleChatCompletions中记录
+      } else if (url.pathname === "/v1/responses") {
+        const response = await handleResponses(request);
         await respondWith(response);
         // 请求统计已在handleChatCompletions中记录
       } else if (url.pathname === "/internal/session-state") {
@@ -8660,7 +14698,7 @@ async function handleHttp(conn: Deno.Conn) {
           url.pathname,
           response.status,
           Date.now() - startTime,
-          userAgent
+          userAgent,
         );
       } else if (url.pathname === "/internal/pure-code-worker") {
         const response = await handleInternalPureCodeWorker(request);
@@ -8671,7 +14709,7 @@ async function handleHttp(conn: Deno.Conn) {
           url.pathname,
           response.status,
           Date.now() - startTime,
-          userAgent
+          userAgent,
         );
       } else if (url.pathname === "/docs") {
         const response = await handleDocs(request);
@@ -8682,7 +14720,7 @@ async function handleHttp(conn: Deno.Conn) {
           url.pathname,
           response.status,
           Date.now() - startTime,
-          userAgent
+          userAgent,
         );
       } else if (url.pathname === "/deno-deploy") {
         const response = await handleDenoDeploy(request);
@@ -8693,7 +14731,7 @@ async function handleHttp(conn: Deno.Conn) {
           url.pathname,
           response.status,
           Date.now() - startTime,
-          userAgent
+          userAgent,
         );
       } else if (url.pathname === "/dashboard" && DASHBOARD_ENABLED) {
         const response = await handleDashboard(request);
@@ -8704,7 +14742,7 @@ async function handleHttp(conn: Deno.Conn) {
           url.pathname,
           response.status,
           Date.now() - startTime,
-          userAgent
+          userAgent,
         );
       } else if (url.pathname === "/dashboard/stats" && DASHBOARD_ENABLED) {
         const response = await handleDashboardStats(request);
@@ -8715,7 +14753,7 @@ async function handleHttp(conn: Deno.Conn) {
           url.pathname,
           response.status,
           Date.now() - startTime,
-          userAgent
+          userAgent,
         );
       } else if (url.pathname === "/dashboard/requests" && DASHBOARD_ENABLED) {
         const response = await handleDashboardRequests(request);
@@ -8726,7 +14764,7 @@ async function handleHttp(conn: Deno.Conn) {
           url.pathname,
           response.status,
           Date.now() - startTime,
-          userAgent
+          userAgent,
         );
       } else {
         const response = await handleOptions(request);
@@ -8737,7 +14775,7 @@ async function handleHttp(conn: Deno.Conn) {
           url.pathname,
           response.status,
           Date.now() - startTime,
-          userAgent
+          userAgent,
         );
       }
     } catch (error) {
@@ -8750,7 +14788,7 @@ async function handleHttp(conn: Deno.Conn) {
         url.pathname,
         500,
         Date.now() - startTime,
-        userAgent
+        userAgent,
       );
     }
   }
@@ -8772,8 +14810,32 @@ async function handleRequest(request: Request): Promise<Response> {
         url.pathname,
         response.status,
         Date.now() - startTime,
-        userAgent
+        userAgent,
       );
+      return response;
+    } else if (isAIProviderCompatibilityPath(url.pathname)) {
+      const response = await handleAIProviderCompatibilityRoute(
+        request,
+        url.pathname,
+      );
+      if (
+        url.pathname !== "/v1/chat/completions" &&
+        url.pathname !== "/chat/completions" &&
+        url.pathname !== "/v1/responses" &&
+        url.pathname !== "/responses" &&
+        url.pathname !== "/anthropic/v1/messages" &&
+        url.pathname !== "/v1/messages" &&
+        url.pathname !== "/messages"
+      ) {
+        recordRequestStats(startTime, url.pathname, response.status);
+        addLiveRequest(
+          request.method,
+          url.pathname,
+          response.status,
+          Date.now() - startTime,
+          userAgent,
+        );
+      }
       return response;
     } else if (url.pathname === "/v1/models") {
       const response = await handleModels(request);
@@ -8783,11 +14845,15 @@ async function handleRequest(request: Request): Promise<Response> {
         url.pathname,
         response.status,
         Date.now() - startTime,
-        userAgent
+        userAgent,
       );
       return response;
     } else if (url.pathname === "/v1/chat/completions") {
       const response = await handleChatCompletions(request);
+      // 请求统计已在handleChatCompletions中记录
+      return response;
+    } else if (url.pathname === "/v1/responses") {
+      const response = await handleResponses(request);
       // 请求统计已在handleChatCompletions中记录
       return response;
     } else if (url.pathname === "/internal/session-state") {
@@ -8798,7 +14864,7 @@ async function handleRequest(request: Request): Promise<Response> {
         url.pathname,
         response.status,
         Date.now() - startTime,
-        userAgent
+        userAgent,
       );
       return response;
     } else if (url.pathname === "/internal/pure-code-worker") {
@@ -8809,7 +14875,7 @@ async function handleRequest(request: Request): Promise<Response> {
         url.pathname,
         response.status,
         Date.now() - startTime,
-        userAgent
+        userAgent,
       );
       return response;
     } else if (url.pathname === "/docs") {
@@ -8820,7 +14886,7 @@ async function handleRequest(request: Request): Promise<Response> {
         url.pathname,
         response.status,
         Date.now() - startTime,
-        userAgent
+        userAgent,
       );
       return response;
     } else if (url.pathname === "/deno-deploy") {
@@ -8831,7 +14897,7 @@ async function handleRequest(request: Request): Promise<Response> {
         url.pathname,
         response.status,
         Date.now() - startTime,
-        userAgent
+        userAgent,
       );
       return response;
     } else if (url.pathname === "/dashboard" && DASHBOARD_ENABLED) {
@@ -8842,7 +14908,7 @@ async function handleRequest(request: Request): Promise<Response> {
         url.pathname,
         response.status,
         Date.now() - startTime,
-        userAgent
+        userAgent,
       );
       return response;
     } else if (url.pathname === "/dashboard/stats" && DASHBOARD_ENABLED) {
@@ -8853,7 +14919,7 @@ async function handleRequest(request: Request): Promise<Response> {
         url.pathname,
         response.status,
         Date.now() - startTime,
-        userAgent
+        userAgent,
       );
       return response;
     } else if (url.pathname === "/dashboard/requests" && DASHBOARD_ENABLED) {
@@ -8864,7 +14930,7 @@ async function handleRequest(request: Request): Promise<Response> {
         url.pathname,
         response.status,
         Date.now() - startTime,
-        userAgent
+        userAgent,
       );
       return response;
     } else {
@@ -8875,7 +14941,7 @@ async function handleRequest(request: Request): Promise<Response> {
         url.pathname,
         response.status,
         Date.now() - startTime,
-        userAgent
+        userAgent,
       );
       return response;
     }
@@ -8887,7 +14953,7 @@ async function handleRequest(request: Request): Promise<Response> {
       url.pathname,
       500,
       Date.now() - startTime,
-      userAgent
+      userAgent,
     );
     return new Response("Internal Server Error", { status: 500 });
   }

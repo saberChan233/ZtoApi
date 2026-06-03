@@ -1,2 +1,30 @@
 CLAUDE.md
 .serena
+
+# Local secrets / environment
+.env
+*.env
+
+# Local agent/tool configuration
+.ace-tool/
+.antigravitycli/
+.agents/
+.claude/
+.codex/
+.kilo/
+.tmp-test/
+
+# Runtime captures / local sessions
+*.har
+*.trace
+*.log
+chat_sessions.json
+browser_capture*.json
+
+# Common generated directories
+node_modules/
+dist/
+build/
+tmp/
+temp/
+.DS_Store
