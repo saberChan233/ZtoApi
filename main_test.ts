@@ -280,11 +280,24 @@ Deno.test("bridge instruction forbids announcing actions without calling a tool"
   assert(text.includes("FORBIDDEN"));
   assert(text.toLowerCase().includes("never announce"));
   assert(text.includes("我先看下目录结构"));
-  // Both payload shapes are documented and every tool name is listed.
-  assert(text.includes("<tool_calls>"));
+  // The native XML-tag shape (using a real tool name) is the documented format,
+  // plus the JSON shape; every tool name is listed.
+  assert(text.includes("<read_file>"));
   assert(text.includes('{"tool_calls"'));
   assert(text.includes("read_file"));
   assert(text.includes("bash"));
+  // Must pin the model to the exact client tool names and forbid invented ones.
+  assert(text.includes("[read_file, bash]"));
+  assert(text.includes("list_files"));
+});
+
+Deno.test("bridge instruction + reminder forbid invented tool names and pin the list", () => {
+  const reminder = buildZaiToolCallBridgeReminder(req({ tool_choice: "auto" }));
+  // Reminder (last, highest-salience message) must enumerate exact names, show
+  // the native-tag format with a real tool, and forbid Cline-style aliases.
+  assert(reminder.includes("[read_file, bash]"));
+  assert(reminder.includes("<read_file>"));
+  assert(reminder.includes("list_files"));
 });
 
 Deno.test("bridge reminder names the forced tool when tool_choice is an object", () => {

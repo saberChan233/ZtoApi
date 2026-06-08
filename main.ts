@@ -1698,8 +1698,17 @@ function stringifyToolSchema(tool: Tool): string {
   }
 }
 
+// Build the exact list of tool names the client sent. The model MUST pick from
+// this list and MUST NOT invent names (e.g. it tends to emit Cline's canonical
+// `list_files` even when the real tool for that job is `glob`).
+function toolNameList(req: OpenAIRequest): string {
+  return (req.tools || []).map((tool) => tool.function.name).join(", ");
+}
+
 export function buildZaiToolCallBridgeInstruction(req: OpenAIRequest): string {
   const tools = (req.tools || []).map(stringifyToolSchema).join("\n");
+  const names = toolNameList(req);
+  const exampleTool = req.tools?.[0]?.function.name || "tool_name";
   const forcedTool = typeof req.tool_choice === "object"
     ? req.tool_choice.function.name
     : "";
@@ -1718,12 +1727,13 @@ export function buildZaiToolCallBridgeInstruction(req: OpenAIRequest): string {
     "You may call tools across multiple turns. When enough evidence is available, provide the final answer instead of calling another tool.",
     "Never claim that you inspected files, directories, commands, MCP resources, or the current project unless a tool result was provided in this conversation.",
     "When a tool is needed, output ONLY one tool-call payload: no markdown, no prose, no explanation, no thinking text in the answer.",
-    "Preferred DSML/XML shape:",
-    '<tool_calls><invoke name="tool_name"><parameter name="arg">value</parameter></invoke></tool_calls>',
-    "Alternative JSON shape:",
-    '{"tool_calls":[{"name":"tool_name","arguments":{}}]}',
-    "If you are unsure what to do next, call a safe inspection/search tool rather than narrating.",
-    "Available tools:",
+    "HOW TO CALL A TOOL: emit an XML element whose tag is the EXACT tool name and whose child elements are its parameters, e.g.:",
+    `<${exampleTool}><param_name>value</param_name></${exampleTool}>`,
+    "An equivalent JSON shape is also accepted:",
+    '{"tool_calls":[{"name":"EXACT_tool_name","arguments":{}}]}',
+    `CRITICAL — TOOL NAMES: you may ONLY use a tool name from this exact list: [${names}]. Do NOT invent, translate, or guess a name. In particular do NOT use names like list_files, read_file, search_files, execute_command from other systems — choose the matching tool from the list above (for example, to explore the project use the listing/search tool that exists in that list, NOT list_files).`,
+    "If you are unsure what to do next, call a safe inspection/search tool from the list rather than narrating.",
+    "Available tools (name, description, parameters):",
     tools,
   ].join("\n");
 }
@@ -1737,11 +1747,14 @@ export function buildZaiToolCallBridgeReminder(req: OpenAIRequest): string {
   const forcedTool = typeof req.tool_choice === "object"
     ? req.tool_choice.function.name
     : "";
+  const names = toolNameList(req);
+  const exampleTool = req.tools?.[0]?.function.name || "tool_name";
   const lines = [
     "[tool-call bridge] Reminder before you answer:",
     "- Reply with EITHER exactly one tool-call payload OR your final answer — never both, never neither.",
     "- Do NOT describe what you are about to do. If you intend to use a tool, emit the tool-call payload as your entire reply now.",
-    '- Payload shape: <tool_calls><invoke name="tool_name"><parameter name="arg">value</parameter></invoke></tool_calls> (or {"tool_calls":[{"name":"tool_name","arguments":{}}]}).',
+    `- To call a tool, emit an XML element whose tag is the EXACT tool name, e.g. <${exampleTool}><param_name>value</param_name></${exampleTool}>.`,
+    `- The tool name MUST be one of EXACTLY these: [${names}]. Do NOT invent or rename (e.g. NEVER use list_files / read_file / search_files / execute_command — use the matching name from this list).`,
   ];
   if (forcedTool) {
     lines.push(`- You must call the tool named ${forcedTool} now.`);
