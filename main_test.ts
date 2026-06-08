@@ -18,6 +18,8 @@ import {
   buildZaiFallbackToolCalls,
   buildZaiToolCallBridgeInstruction,
   buildZaiToolCallBridgeReminder,
+  extractZaiBridgeToolCalls,
+  extractZaiNativeXmlToolCalls,
   injectZaiToolCallBridgeInstruction,
   looksLikeToolMarkerPrefix,
   type Message,
@@ -27,6 +29,7 @@ import {
   shouldFallbackToZaiToolCall,
   type Tool,
   toolBridgeFlushBoundary,
+  toolTagMarkerPrefixes,
 } from "./main.ts";
 
 const readFileTool: Tool = {
@@ -293,4 +296,74 @@ Deno.test("bridge reminder names the forced tool when tool_choice is an object",
   const auto = buildZaiToolCallBridgeReminder(req({ tool_choice: "auto" }));
   assert(!auto.includes("must call the tool named"));
   assert(auto.includes("EITHER exactly one tool-call payload"));
+});
+
+// --- Native client-XML tool tags (Cline / Roo / Kilo shape) ----------------
+
+Deno.test("extractZaiNativeXmlToolCalls: recognizes a bare client tool tag", () => {
+  // The model emits the tool name directly as an XML element (the format Kilo's
+  // own system prompt documents), instead of <tool_calls><invoke>.
+  const calls = extractZaiNativeXmlToolCalls(
+    "Let me check the files first.\n<read_file><path>main.ts</path></read_file>",
+    [readFileTool, bashTool],
+  );
+  assertEquals(calls.length, 1);
+  assertEquals(calls[0].function.name, "read_file");
+  assertEquals(JSON.parse(calls[0].function.arguments), { path: "main.ts" });
+});
+
+Deno.test("extractZaiNativeXmlToolCalls: parses multiple params and a second tag", () => {
+  const calls = extractZaiNativeXmlToolCalls(
+    "<bash><command>ls -la</command></bash>",
+    [readFileTool, bashTool],
+  );
+  assertEquals(calls.length, 1);
+  assertEquals(calls[0].function.name, "bash");
+  assertEquals(JSON.parse(calls[0].function.arguments), { command: "ls -la" });
+});
+
+Deno.test("extractZaiNativeXmlToolCalls: ignores tags that are not client tools", () => {
+  // <list_files> is NOT one of the client's tools, so it must NOT be coerced
+  // into a tool call (avoids hijacking with a name the client cannot execute).
+  assertEquals(
+    extractZaiNativeXmlToolCalls(
+      "首先，让我查看目录结构。\n<list_files><path>.</path></list_files>",
+      [readFileTool, bashTool],
+    ),
+    [],
+  );
+  // No tools => never coerce (prevents false positives on prose with angle tags).
+  assertEquals(
+    extractZaiNativeXmlToolCalls("<read_file><path>x</path></read_file>", []),
+    [],
+  );
+});
+
+Deno.test("extractZaiBridgeToolCalls: native XML path is reached after markup/JSON", () => {
+  // End-to-end: the unified extractor now also recognizes the native tag shape.
+  const calls = extractZaiBridgeToolCalls(
+    "<read_file><path>README.md</path></read_file>",
+    [readFileTool, bashTool],
+  );
+  assertEquals(calls.length, 1);
+  assertEquals(calls[0].function.name, "read_file");
+  // The canonical <tool_calls><invoke> shape still wins and is unchanged.
+  const invoke = extractZaiBridgeToolCalls(
+    '<tool_calls><invoke name="bash"><parameter name="command">pwd</parameter></invoke></tool_calls>',
+    [readFileTool, bashTool],
+  );
+  assertEquals(invoke[0].function.name, "bash");
+});
+
+Deno.test("toolTagMarkerPrefixes + leak guard hold a partial native tag", () => {
+  const prefixes = toolTagMarkerPrefixes(["read_file", "bash"]);
+  assert(prefixes.includes("<read_file"));
+  // A partial bare tag arriving across chunks must be held, not streamed.
+  assert(looksLikeToolMarkerPrefix("<read_fi", prefixes));
+  // Without the client tool prefixes, the old guard would leak it as text.
+  assertEquals(looksLikeToolMarkerPrefix("<read_fi"), false);
+  // Prose before a native tag streams up to the tag, which is held back.
+  const buf = "Let me check first <read_file><path>";
+  const boundary = toolBridgeFlushBoundary(buf, prefixes);
+  assertEquals(buf.slice(0, boundary), "Let me check first ");
 });
