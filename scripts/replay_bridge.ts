@@ -31,8 +31,8 @@ function toolsFromNames(names: string[]): Tool[] {
   }));
 }
 
-function preview(text: string, max = 600): string {
-  const t = text.replace(/\s+/g, " ").trim();
+function preview(text: string, max = 4000): string {
+  const t = text.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
   return t.length > max ? t.slice(0, max) + " …[+" + (t.length - max) + "]" : t;
 }
 
@@ -84,9 +84,11 @@ function main() {
         console.log(`  ⚠ content has bare <${name}> tag NOT recognized`);
       }
     }
-    if (recognized.length === 0) {
-      console.log(`  content_preview: ${preview(content)}`);
-      if (reasoning) console.log(`  reasoning_preview: ${preview(reasoning)}`);
+    console.log(`  --- content (raw model output) ---`);
+    console.log(preview(content) || "(empty)");
+    if (reasoning) {
+      console.log(`  --- reasoning ---`);
+      console.log(preview(reasoning, 1200));
     }
     console.log("");
   }
