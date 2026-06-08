@@ -85,7 +85,11 @@ declare namespace Deno {
   function readTextFile(path: string | URL): Promise<string>;
   function readTextFileSync(path: string | URL): string;
   function writeTextFile(path: string | URL, data: string): Promise<void>;
-  function writeTextFileSync(path: string | URL, data: string): void;
+  function writeTextFileSync(
+    path: string | URL,
+    data: string,
+    options?: { append?: boolean },
+  ): void;
   function readFile(path: string | URL): Promise<Uint8Array>;
   function writeFile(path: string | URL, data: Uint8Array): Promise<void>;
   function mkdir(
@@ -1694,8 +1698,17 @@ function stringifyToolSchema(tool: Tool): string {
   }
 }
 
+// Build the exact list of tool names the client sent. The model MUST pick from
+// this list and MUST NOT invent names (e.g. it tends to emit Cline's canonical
+// `list_files` even when the real tool for that job is `glob`).
+function toolNameList(req: OpenAIRequest): string {
+  return (req.tools || []).map((tool) => tool.function.name).join(", ");
+}
+
 export function buildZaiToolCallBridgeInstruction(req: OpenAIRequest): string {
   const tools = (req.tools || []).map(stringifyToolSchema).join("\n");
+  const names = toolNameList(req);
+  const exampleTool = req.tools?.[0]?.function.name || "tool_name";
   const forcedTool = typeof req.tool_choice === "object"
     ? req.tool_choice.function.name
     : "";
@@ -1714,12 +1727,13 @@ export function buildZaiToolCallBridgeInstruction(req: OpenAIRequest): string {
     "You may call tools across multiple turns. When enough evidence is available, provide the final answer instead of calling another tool.",
     "Never claim that you inspected files, directories, commands, MCP resources, or the current project unless a tool result was provided in this conversation.",
     "When a tool is needed, output ONLY one tool-call payload: no markdown, no prose, no explanation, no thinking text in the answer.",
-    "Preferred DSML/XML shape:",
-    '<tool_calls><invoke name="tool_name"><parameter name="arg">value</parameter></invoke></tool_calls>',
-    "Alternative JSON shape:",
-    '{"tool_calls":[{"name":"tool_name","arguments":{}}]}',
-    "If you are unsure what to do next, call a safe inspection/search tool rather than narrating.",
-    "Available tools:",
+    "HOW TO CALL A TOOL: emit an XML element whose tag is the EXACT tool name and whose child elements are its parameters, e.g.:",
+    `<${exampleTool}><param_name>value</param_name></${exampleTool}>`,
+    "An equivalent JSON shape is also accepted:",
+    '{"tool_calls":[{"name":"EXACT_tool_name","arguments":{}}]}',
+    `CRITICAL — TOOL NAMES: you may ONLY use a tool name from this exact list: [${names}]. Do NOT invent, translate, or guess a name. In particular do NOT use names like list_files, read_file, search_files, execute_command from other systems — choose the matching tool from the list above (for example, to explore the project use the listing/search tool that exists in that list, NOT list_files).`,
+    "If you are unsure what to do next, call a safe inspection/search tool from the list rather than narrating.",
+    "Available tools (name, description, parameters):",
     tools,
   ].join("\n");
 }
@@ -1733,11 +1747,14 @@ export function buildZaiToolCallBridgeReminder(req: OpenAIRequest): string {
   const forcedTool = typeof req.tool_choice === "object"
     ? req.tool_choice.function.name
     : "";
+  const names = toolNameList(req);
+  const exampleTool = req.tools?.[0]?.function.name || "tool_name";
   const lines = [
     "[tool-call bridge] Reminder before you answer:",
     "- Reply with EITHER exactly one tool-call payload OR your final answer — never both, never neither.",
     "- Do NOT describe what you are about to do. If you intend to use a tool, emit the tool-call payload as your entire reply now.",
-    '- Payload shape: <tool_calls><invoke name="tool_name"><parameter name="arg">value</parameter></invoke></tool_calls> (or {"tool_calls":[{"name":"tool_name","arguments":{}}]}).',
+    `- To call a tool, emit an XML element whose tag is the EXACT tool name, e.g. <${exampleTool}><param_name>value</param_name></${exampleTool}>.`,
+    `- The tool name MUST be one of EXACTLY these: [${names}]. Do NOT invent or rename (e.g. NEVER use list_files / read_file / search_files / execute_command — use the matching name from this list).`,
   ];
   if (forcedTool) {
     lines.push(`- You must call the tool named ${forcedTool} now.`);
@@ -1837,7 +1854,7 @@ function normalizeToolMarkup(content: string): string {
     .replace(/＞/g, ">");
 }
 
-function extractZaiMarkupToolCalls(
+export function extractZaiMarkupToolCalls(
   content: string,
   tools?: Tool[],
 ): ToolCall[] {
@@ -1898,13 +1915,66 @@ function createToolCallId(): string {
   return `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
 }
 
-function extractZaiBridgeToolCalls(
+// Recognize the model emitting a tool call as a bare, client-native XML tag,
+// e.g. `<read><path>main.ts</path></read>` or `<bash><command>ls</command></bash>`.
+// This is the tool format Cline / Roo Code / Kilo Code document in their own
+// (very large) system prompt, so GLM frequently emits THAT shape instead of the
+// `<tool_calls><invoke>` shape the bridge instruction asks for. To avoid false
+// positives we only match tags whose name is an actual tool the client sent,
+// and only when the element is well-formed (proper closing or self-closing tag).
+export function extractZaiNativeXmlToolCalls(
+  content: string,
+  tools?: Tool[],
+): ToolCall[] {
+  const toolNames = (tools || []).map((tool) => tool.function.name).filter((
+    name,
+  ) => /^[A-Za-z_][\w.-]*$/.test(name));
+  if (toolNames.length === 0) return [];
+  const normalized = normalizeToolMarkup(content);
+  const nameAlt = toolNames
+    .map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("|");
+  // <name ...>body</name>  OR  <name ... />
+  const tagRegex = new RegExp(
+    `<\\s*(${nameAlt})(\\s[^>]*?)?(?:/\\s*>|>([\\s\\S]*?)<\\s*/\\s*\\1\\s*>)`,
+    "gi",
+  );
+  const calls: ToolCall[] = [];
+  let match: RegExpExecArray | null;
+  while ((match = tagRegex.exec(normalized)) !== null) {
+    const name = match[1];
+    const body = match[3] || "";
+    const args: Record<string, unknown> = {};
+    // Direct child elements are the tool's named parameters.
+    const childRegex =
+      /<\s*([A-Za-z_][\w.-]*)\s*(?:\s[^>]*?)?>([\s\S]*?)<\s*\/\s*\1\s*>/g;
+    let child: RegExpExecArray | null;
+    while ((child = childRegex.exec(body)) !== null) {
+      const key = child[1];
+      if (key.toLowerCase() === name.toLowerCase()) continue;
+      args[key] = parseMarkupParameterValue(child[2] || "");
+    }
+    calls.push({
+      id: createToolCallId(),
+      type: "function",
+      function: { name, arguments: JSON.stringify(args) },
+    });
+  }
+  return calls;
+}
+
+export function extractZaiBridgeToolCalls(
   content: string,
   tools?: Tool[],
 ): ToolCall[] {
   const markupCalls = extractZaiMarkupToolCalls(content, tools);
   if (markupCalls.length > 0) {
     return markupCalls;
+  }
+
+  const nativeXmlCalls = extractZaiNativeXmlToolCalls(content, tools);
+  if (nativeXmlCalls.length > 0) {
+    return nativeXmlCalls;
   }
 
   const parsed = tryParseToolCallJson(content);
@@ -2083,6 +2153,46 @@ export function buildZaiFallbackToolCalls(req: OpenAIRequest): ToolCall[] {
       arguments: JSON.stringify(buildFallbackArgumentsForTool(preferred)),
     },
   }];
+}
+
+// Append one JSON line capturing exactly what the upstream model produced for a
+// tool-call-bridge turn, so the real failure mode can be diagnosed without
+// guessing. No-op unless ZAI_BRIDGE_DEBUG_DUMP points at a file.
+function dumpZaiBridgeDiagnostics(
+  req: OpenAIRequest,
+  content: string,
+  reasoningContent: string,
+  outcome: Message | null,
+): void {
+  if (!ZAI_BRIDGE_DEBUG_DUMP) return;
+  try {
+    const record = {
+      ts: new Date().toISOString(),
+      model: req.model,
+      stream: req.stream === true,
+      tool_choice: req.tool_choice ?? null,
+      client_tools: (req.tools || []).map((t) => t.function.name),
+      recognized_tool_calls: outcome?.tool_calls?.map((c) => c.function.name) ??
+        [],
+      // The exact text the model emitted -- this is the decisive artifact.
+      content,
+      reasoning_content: reasoningContent,
+    };
+    Deno.writeTextFileSync(
+      ZAI_BRIDGE_DEBUG_DUMP,
+      JSON.stringify(record) + "\n",
+      { append: true },
+    );
+    debugLog(
+      "🔧 bridge 诊断已写入 %s: content_len=%d reasoning_len=%d recognized=%d",
+      ZAI_BRIDGE_DEBUG_DUMP,
+      content.length,
+      reasoningContent.length,
+      record.recognized_tool_calls.length,
+    );
+  } catch (error) {
+    debugLog("🔧 bridge 诊断写入失败: %s", String(error));
+  }
 }
 
 function buildZaiBridgeToolCallResponseMessage(
@@ -2377,6 +2487,13 @@ const ZAI_TOOL_CALL_BRIDGE = Deno.env.get("ZAI_TOOL_CALL_BRIDGE") !== "false";
 // agentic clients (pi, Claude Code, Codex, ...) keep full control over planning.
 const ZAI_TOOL_CALL_BRIDGE_AUTO_FALLBACK =
   Deno.env.get("ZAI_TOOL_CALL_BRIDGE_AUTO_FALLBACK") === "true";
+// Opt-in diagnostics: when set to a file path, every tool-call-bridge turn
+// appends one JSON line with the EXACT raw model output (content + reasoning),
+// the tool names the client sent, and whether the bridge recognized a tool
+// call. Off by default. This is the artifact needed to debug why an agentic
+// client (Kilo/pi/Claude Code) stops after the model narrates instead of
+// emitting a tool call -- it captures what the real upstream model emitted.
+const ZAI_BRIDGE_DEBUG_DUMP = Deno.env.get("ZAI_BRIDGE_DEBUG_DUMP") || "";
 const UPSTREAM_EXPLICIT_CONVERSATION_HEADER = "x-ztoapi-conversation-id";
 const UPSTREAM_SESSION_KEY_SECRET =
   (Deno.env.get("UPSTREAM_SESSION_KEY_SECRET") || "ztoapi-session-v2").trim();
@@ -7466,10 +7583,23 @@ const TOOL_MARKER_COMPACT_PREFIXES = [
   '{"tool_calls"',
 ];
 
+// Build the compact `<toolname` prefixes for the client's native tool tags so a
+// bare tag like `<read ...>` is held back across chunks instead of leaking as
+// plain text before its closing tag arrives.
+export function toolTagMarkerPrefixes(toolNames?: string[]): string[] {
+  return (toolNames || [])
+    .filter((name) => /^[A-Za-z_][\w.-]*$/.test(name))
+    .map((name) => `<${name.toLowerCase()}`);
+}
+
 // Whether `rawTail` could be the (possibly incomplete) beginning of a tool-call
 // marker. Tolerant to DSML/full-width drift via normalizeToolMarkup so partial
-// markers are never streamed to the user as plain text.
-export function looksLikeToolMarkerPrefix(rawTail: string): boolean {
+// markers are never streamed to the user as plain text. `extraPrefixes` carries
+// the client's native tool tags (e.g. `<read`, `<bash`) so those are held too.
+export function looksLikeToolMarkerPrefix(
+  rawTail: string,
+  extraPrefixes?: string[],
+): boolean {
   if (!rawTail) return false;
   const first = rawTail[0];
   if (first === "`") {
@@ -7482,7 +7612,10 @@ export function looksLikeToolMarkerPrefix(rawTail: string): boolean {
     "",
   );
   if (!compact) return false;
-  return TOOL_MARKER_COMPACT_PREFIXES.some((marker) => {
+  const markers = extraPrefixes && extraPrefixes.length
+    ? [...TOOL_MARKER_COMPACT_PREFIXES, ...extraPrefixes]
+    : TOOL_MARKER_COMPACT_PREFIXES;
+  return markers.some((marker) => {
     const n = Math.min(compact.length, marker.length);
     return compact.slice(0, n) === marker.slice(0, n);
   });
@@ -7492,11 +7625,14 @@ export function looksLikeToolMarkerPrefix(rawTail: string): boolean {
 // tool-call marker that has not fully arrived yet. Everything before the index
 // is safe to stream immediately; the tail is held until the marker either
 // completes (routed as a tool call) or the stream ends (flushed as plain text).
-export function toolBridgeFlushBoundary(buffer: string): number {
+export function toolBridgeFlushBoundary(
+  buffer: string,
+  extraPrefixes?: string[],
+): number {
   for (let i = 0; i < buffer.length; i++) {
     const c = buffer[i];
     if (c === "<" || c === "{" || c === "`") {
-      if (looksLikeToolMarkerPrefix(buffer.slice(i, i + 32))) {
+      if (looksLikeToolMarkerPrefix(buffer.slice(i, i + 32), extraPrefixes)) {
         return i;
       }
     }
@@ -7580,6 +7716,11 @@ async function processZaiToolBridgeStream(
   let reasoningContent = "";
   let pendingContent = "";
   let firstDeltaLogged = false;
+  // Native tool tags the client sent (e.g. `<read`, `<bash`) so a partial bare
+  // tag is held back instead of leaking as visible text before it completes.
+  const toolTagPrefixes = toolTagMarkerPrefixes(
+    (req.tools || []).map((tool) => tool.function.name),
+  );
 
   try {
     while (true) {
@@ -7625,15 +7766,18 @@ async function processZaiToolBridgeStream(
             );
             if (directToolCalls.length > 0) {
               debugLog("🔧 Z.ai stream sieve 检测到工具调用，停止自然语言输出");
-              return {
+              const toolCallMessage: Message = {
+                role: "assistant",
+                content: null,
+                tool_calls: directToolCalls,
+              };
+              dumpZaiBridgeDiagnostics(
+                req,
                 content,
                 reasoningContent,
-                toolCallMessage: {
-                  role: "assistant",
-                  content: null,
-                  tool_calls: directToolCalls,
-                },
-              };
+                toolCallMessage,
+              );
+              return { content, reasoningContent, toolCallMessage };
             }
 
             // Stream natural-language text smoothly, but never leak a tool-call
@@ -7641,7 +7785,10 @@ async function processZaiToolBridgeStream(
             // emit everything except a trailing segment that could be the start
             // of a marker still arriving across chunks.
             if (!shouldHoldToolBridgeTextForSieve(content)) {
-              const boundary = toolBridgeFlushBoundary(pendingContent);
+              const boundary = toolBridgeFlushBoundary(
+                pendingContent,
+                toolTagPrefixes,
+              );
               if (boundary > 0) {
                 await writeOpenAIContentStreamChunk(
                   writer,
@@ -7661,6 +7808,12 @@ async function processZaiToolBridgeStream(
             const toolCallMessage = buildZaiBridgeToolCallResponseMessage(
               content,
               req,
+            );
+            dumpZaiBridgeDiagnostics(
+              req,
+              content,
+              reasoningContent,
+              toolCallMessage,
             );
             if (toolCallMessage?.tool_calls?.length) {
               return { content, reasoningContent, toolCallMessage };
@@ -7688,6 +7841,7 @@ async function processZaiToolBridgeStream(
   }
 
   const toolCallMessage = buildZaiBridgeToolCallResponseMessage(content, req);
+  dumpZaiBridgeDiagnostics(req, content, reasoningContent, toolCallMessage);
   if (toolCallMessage?.tool_calls?.length) {
     return { content, reasoningContent, toolCallMessage };
   }
@@ -11877,6 +12031,14 @@ async function handleNonStreamResponse(
     const bridgeToolCallMessage = shouldUseZaiToolCallBridge(req)
       ? buildZaiBridgeToolCallResponseMessage(responsePayload.content, req)
       : null;
+    if (shouldUseZaiToolCallBridge(req)) {
+      dumpZaiBridgeDiagnostics(
+        req,
+        responsePayload.content,
+        responsePayload.reasoningContent,
+        bridgeToolCallMessage,
+      );
+    }
 
     // 构造完整响应
     const responseMessage: Message = bridgeToolCallMessage || {
